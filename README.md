@@ -183,4 +183,11 @@ var Phases = []Phase{
 
 Library: `github.com/juju/ratelimit` уже присутствует в дереве зависимостей сервера как транзитивная зависимость `xtls/reality`.
 
+---
 
+## Использование
+
+Ниже одни из сценариев использования Umbrella-протокола.
+
+- Windows: запускаю `client`, использую Clash Verge в режиме TUN.
+- Android: запускаю `client` через Termux, на устройстве включаю VPN через SocksDroid.
