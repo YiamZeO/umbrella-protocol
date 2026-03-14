@@ -29,6 +29,7 @@ var (
 	gSNI          string
 	gServerPubKey []byte
 	gShortId      [8]byte
+	gUDPEnabled   bool
 
 	sessMu sync.Mutex
 	sess   *yamux.Session
@@ -40,7 +41,10 @@ func main() {
 	shortIdHex := flag.String("short-id", "", "Reality short ID in hex, up to 16 chars (required)")
 	sni := flag.String("sni", "cloudflare.com", "SNI to use in TLS Client Hello")
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "local SOCKS5 listen address")
+	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	flag.Parse()
+
+	gUDPEnabled = *udpEnabled
 
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -267,7 +271,8 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 		var portBytes [2]byte
 		binary.BigEndian.PutUint16(portBytes[:], destPort)
 
-		req := append(addrBytes, portBytes[:]...)
+		req := append([]byte{0x00}, addrBytes...)
+		req = append(req, portBytes[:]...)
 		if _, err := stream.Write(req); err != nil {
 			stream.Close()
 			return nil, fmt.Errorf("write tunnel request: %w", err)
@@ -289,13 +294,149 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 	return nil, fmt.Errorf("failed to open stream after retry")
 }
 
+// openUDPStream opens a yamux stream for UDP relay and returns it after server ACK.
+func openUDPStream() (net.Conn, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		s, err := getSession()
+		if err != nil {
+			return nil, err
+		}
+		stream, err := s.Open()
+		if err != nil {
+			sessMu.Lock()
+			if sess == s {
+				sess = nil
+			}
+			sessMu.Unlock()
+			continue
+		}
+		if _, err := stream.Write([]byte{0x01}); err != nil {
+			stream.Close()
+			return nil, fmt.Errorf("write UDP cmd: %w", err)
+		}
+		var ack [1]byte
+		if _, err := io.ReadFull(stream, ack[:]); err != nil {
+			stream.Close()
+			return nil, fmt.Errorf("read UDP ack: %w", err)
+		}
+		if ack[0] != 0x00 {
+			stream.Close()
+			return nil, fmt.Errorf("server rejected UDP relay")
+		}
+		return stream, nil
+	}
+	return nil, fmt.Errorf("failed to open UDP stream after retry")
+}
+
+// handleSocks5UDP handles a SOCKS5 UDP ASSOCIATE request.
+// It opens a yamux UDP relay stream to the server, binds a local UDP socket,
+// and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
+// connection is closed by the client (RFC 1928).
+func handleSocks5UDP(tcpConn net.Conn) {
+	// Open relay stream first so we can signal failure before replying to client.
+	stream, err := openUDPStream()
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		log.Printf("UDP ASSOCIATE stream error: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		log.Printf("UDP ASSOCIATE listen error: %v", err)
+		return
+	}
+	defer udpConn.Close()
+
+	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(udpAddr.Port >> 8), byte(udpAddr.Port)}
+	if _, err := tcpConn.Write(reply); err != nil {
+		return
+	}
+
+	log.Printf("UDP relay active, local UDP: %s", udpAddr)
+
+	var addrMu sync.Mutex
+	var appAddr net.Addr
+
+	// App → Server: receive SOCKS5 UDP datagrams, strip RSV(2)+FRAG(1) prefix,
+	// and forward [ATYP+ADDR+PORT+DATA] as length-prefixed frames over the relay stream.
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, addr, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			addrMu.Lock()
+			appAddr = addr
+			addrMu.Unlock()
+			// RSV(2)+FRAG(1)+ATYP(1) = 4 bytes minimum; drop fragmented datagrams (FRAG!=0).
+			if n < 4 || buf[2] != 0x00 {
+				continue
+			}
+			payload := buf[3:n] // ATYP + ADDR + PORT + DATA
+			frame := make([]byte, 4+len(payload))
+			binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+			copy(frame[4:], payload)
+			stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := stream.Write(frame); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Server → App: receive length-prefixed frames, wrap in SOCKS5 UDP header,
+	// and send to the app's UDP address.
+	go func() {
+		lenBuf := make([]byte, 4)
+		for {
+			if _, err := io.ReadFull(stream, lenBuf); err != nil {
+				udpConn.Close()
+				return
+			}
+			payloadLen := binary.BigEndian.Uint32(lenBuf)
+			if payloadLen > 65535 {
+				udpConn.Close()
+				return
+			}
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(stream, payload); err != nil {
+				udpConn.Close()
+				return
+			}
+			addrMu.Lock()
+			a := appAddr
+			addrMu.Unlock()
+			if a == nil {
+				continue
+			}
+			// SOCKS5 UDP datagram: RSV(2)+FRAG(1)+[ATYP+ADDR+PORT+DATA]
+			pkt := make([]byte, 3+len(payload))
+			pkt[0], pkt[1], pkt[2] = 0, 0, 0
+			copy(pkt[3:], payload)
+			udpConn.WriteTo(pkt, a)
+		}
+	}()
+
+	// The association stays alive as long as the TCP control connection is open (RFC 1928).
+	io.Copy(io.Discard, tcpConn)
+}
+
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
 func handleSocks5(conn net.Conn) {
 	defer conn.Close()
 
-	host, port, err := socks5Handshake(conn)
+	cmd, host, port, err := socks5Handshake(conn)
 	if err != nil {
 		log.Printf("SOCKS5 handshake error from %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	if cmd == 0x03 { // UDP ASSOCIATE
+		handleSocks5UDP(conn)
 		return
 	}
 
@@ -325,70 +466,79 @@ func handleSocks5(conn net.Conn) {
 }
 
 // socks5Handshake performs the SOCKS5 greeting + request exchange.
-// Returns the destination host and port requested by the client.
-func socks5Handshake(conn net.Conn) (host string, port uint16, err error) {
+// Returns the command byte (0x01 CONNECT or 0x03 UDP ASSOCIATE) and
+// destination host/port (populated for CONNECT; addr hint for UDP ASSOCIATE).
+func socks5Handshake(conn net.Conn) (cmd byte, host string, port uint16, err error) {
 	// --- Greeting ---
 	header := make([]byte, 2)
 	if _, err = io.ReadFull(conn, header); err != nil {
-		return "", 0, fmt.Errorf("read greeting: %w", err)
+		return 0, "", 0, fmt.Errorf("read greeting: %w", err)
 	}
 	if header[0] != 0x05 {
-		return "", 0, fmt.Errorf("expected SOCKS5, got version %d", header[0])
+		return 0, "", 0, fmt.Errorf("expected SOCKS5, got version %d", header[0])
 	}
 	methods := make([]byte, header[1])
 	if _, err = io.ReadFull(conn, methods); err != nil {
-		return "", 0, fmt.Errorf("read methods: %w", err)
+		return 0, "", 0, fmt.Errorf("read methods: %w", err)
 	}
 	// Select no-auth
 	if _, err = conn.Write([]byte{0x05, 0x00}); err != nil {
-		return "", 0, fmt.Errorf("write method selection: %w", err)
+		return 0, "", 0, fmt.Errorf("write method selection: %w", err)
 	}
 
 	// --- Request ---
 	req := make([]byte, 4)
 	if _, err = io.ReadFull(conn, req); err != nil {
-		return "", 0, fmt.Errorf("read request: %w", err)
+		return 0, "", 0, fmt.Errorf("read request: %w", err)
 	}
 	if req[0] != 0x05 {
-		return "", 0, fmt.Errorf("invalid request version: %d", req[0])
+		return 0, "", 0, fmt.Errorf("invalid request version: %d", req[0])
 	}
-	if req[1] != 0x01 {
+	cmd = req[1]
+	switch cmd {
+	case 0x01: // CONNECT — TCP
+	case 0x03: // UDP ASSOCIATE
+		if !gUDPEnabled {
+			conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return 0, "", 0, fmt.Errorf("UDP ASSOCIATE disabled (--udp=false)")
+		}
+	default:
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return "", 0, fmt.Errorf("unsupported SOCKS5 command: %d", req[1])
+		return 0, "", 0, fmt.Errorf("unsupported SOCKS5 command: 0x%02x", cmd)
 	}
 
 	switch req[3] {
 	case 0x01: // IPv4
 		ip := make([]byte, 4)
 		if _, err = io.ReadFull(conn, ip); err != nil {
-			return "", 0, fmt.Errorf("read IPv4: %w", err)
+			return 0, "", 0, fmt.Errorf("read IPv4: %w", err)
 		}
 		host = net.IP(ip).String()
 	case 0x03: // domain
 		lenBuf := make([]byte, 1)
 		if _, err = io.ReadFull(conn, lenBuf); err != nil {
-			return "", 0, fmt.Errorf("read domain length: %w", err)
+			return 0, "", 0, fmt.Errorf("read domain length: %w", err)
 		}
 		domain := make([]byte, lenBuf[0])
 		if _, err = io.ReadFull(conn, domain); err != nil {
-			return "", 0, fmt.Errorf("read domain: %w", err)
+			return 0, "", 0, fmt.Errorf("read domain: %w", err)
 		}
 		host = string(domain)
 	case 0x04: // IPv6
 		ip := make([]byte, 16)
 		if _, err = io.ReadFull(conn, ip); err != nil {
-			return "", 0, fmt.Errorf("read IPv6: %w", err)
+			return 0, "", 0, fmt.Errorf("read IPv6: %w", err)
 		}
 		host = net.IP(ip).String()
 	default:
 		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return "", 0, fmt.Errorf("unsupported address type: 0x%02x", req[3])
+		return 0, "", 0, fmt.Errorf("unsupported address type: 0x%02x", req[3])
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err = io.ReadFull(conn, portBuf); err != nil {
-		return "", 0, fmt.Errorf("read port: %w", err)
+		return 0, "", 0, fmt.Errorf("read port: %w", err)
 	}
 	port = binary.BigEndian.Uint16(portBuf)
-	return host, port, nil
+	return cmd, host, port, nil
 }

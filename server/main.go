@@ -136,8 +136,23 @@ func handleConn(conn net.Conn) {
 		}
 		go func(s net.Conn) {
 			defer s.Close()
-			if err := handleTunnel(s); err != nil {
-				log.Printf("tunnel: %v", err)
+			cmdBuf := make([]byte, 1)
+			if _, err := io.ReadFull(s, cmdBuf); err != nil {
+				log.Printf("read stream cmd from %s: %v", conn.RemoteAddr(), err)
+				return
+			}
+			var streamErr error
+			switch cmdBuf[0] {
+			case 0x00:
+				streamErr = handleTunnel(s)
+			case 0x01:
+				streamErr = handleUDPRelay(s)
+			default:
+				log.Printf("unknown stream cmd 0x%02x from %s", cmdBuf[0], conn.RemoteAddr())
+				return
+			}
+			if streamErr != nil {
+				log.Printf("stream error from %s: %v", conn.RemoteAddr(), streamErr)
 			}
 		}(stream)
 	}
@@ -226,4 +241,116 @@ func handleTunnel(conn net.Conn) error {
 	<-done
 
 	return nil
+}
+
+// handleUDPRelay handles a UDP relay stream from a client.
+// It receives length-prefixed frames [4B len][ATYP+ADDR+PORT+DATA], dispatches
+// them as UDP datagrams to the target, and returns responses in the same framing.
+func handleUDPRelay(stream net.Conn) error {
+	if _, err := stream.Write([]byte{0x00}); err != nil {
+		return fmt.Errorf("write UDP ack: %w", err)
+	}
+
+	pc, err := net.ListenPacket("udp", "0.0.0.0:0")
+	if err != nil {
+		return fmt.Errorf("UDP listen: %w", err)
+	}
+	defer pc.Close()
+
+	const idleTimeout = 2 * time.Minute
+
+	// Stream → UDP: parse length-prefixed frames and dispatch to target.
+	go func() {
+		lenBuf := make([]byte, 4)
+		for {
+			if _, err := io.ReadFull(stream, lenBuf); err != nil {
+				pc.Close()
+				return
+			}
+			payloadLen := binary.BigEndian.Uint32(lenBuf)
+			if payloadLen > 65535 {
+				pc.Close()
+				return
+			}
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(stream, payload); err != nil {
+				pc.Close()
+				return
+			}
+			if len(payload) < 4 {
+				continue
+			}
+			var host string
+			var addrEnd int
+			switch payload[0] {
+			case 0x01: // IPv4
+				if len(payload) < 7 {
+					continue
+				}
+				host = net.IP(payload[1:5]).String()
+				addrEnd = 5
+			case 0x03: // domain
+				if len(payload) < 3 {
+					continue
+				}
+				nameLen := int(payload[1])
+				if len(payload) < 2+nameLen+2 {
+					continue
+				}
+				host = string(payload[2 : 2+nameLen])
+				addrEnd = 2 + nameLen
+			case 0x04: // IPv6
+				if len(payload) < 19 {
+					continue
+				}
+				host = net.IP(payload[1:17]).String()
+				addrEnd = 17
+			default:
+				continue
+			}
+			if len(payload) < addrEnd+2 {
+				continue
+			}
+			port := binary.BigEndian.Uint16(payload[addrEnd : addrEnd+2])
+			data := payload[addrEnd+2:]
+			target := fmt.Sprintf("%s:%d", host, port)
+			addr, err := net.ResolveUDPAddr("udp", target)
+			if err != nil {
+				log.Printf("UDP relay: resolve %s: %v", target, err)
+				continue
+			}
+			pc.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := pc.WriteTo(data, addr); err != nil {
+				log.Printf("UDP relay: write to %s: %v", target, err)
+			}
+		}
+	}()
+
+	// UDP → Stream: receive responses and forward to client as length-prefixed frames.
+	buf := make([]byte, 65535)
+	for {
+		pc.SetReadDeadline(time.Now().Add(idleTimeout))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return nil // idle timeout or PacketConn closed
+		}
+		udpAddr := addr.(*net.UDPAddr)
+		var addrBytes []byte
+		if ip4 := udpAddr.IP.To4(); ip4 != nil {
+			addrBytes = append([]byte{0x01}, ip4...)
+		} else {
+			addrBytes = append([]byte{0x04}, udpAddr.IP.To16()...)
+		}
+		addrBytes = append(addrBytes, byte(udpAddr.Port>>8), byte(udpAddr.Port))
+		payload := append(addrBytes, buf[:n]...)
+
+		frame := make([]byte, 4+len(payload))
+		binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+		copy(frame[4:], payload)
+
+		stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := stream.Write(frame); err != nil {
+			return fmt.Errorf("write UDP frame: %w", err)
+		}
+	}
 }

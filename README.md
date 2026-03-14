@@ -64,7 +64,7 @@ XTLS Vision был создан для решения проблемы **TLS-in-
 | SOCKS5 (IPv4 / IPv6 / domain) | ✅ реализовано |
 | Ротация сессии каждые 3–15 мин | ✅ реализовано |
 | SmartShaper — поведенческий shaping трафика | ❌ не реализовано |
-| UDP associate в SOCKS5 | ❌ не реализовано |
+| UDP associate в SOCKS5 | ✅ реализовано |
 
 ---
 
@@ -135,6 +135,7 @@ go build -o umbrella-client .
 | `--short-id` | обязателен | Reality Short ID, hex |
 | `--sni` | `cloudflare.com` | SNI в TLS ClientHello |
 | `--listen` | `127.0.0.1:1080` | Локальный SOCKS5 адрес |
+| `--udp` | `true` | Включить UDP ASSOCIATE; `false` = только TCP |
 
 ### Настройка браузера / системы
 
@@ -182,7 +183,4 @@ var Phases = []Phase{
 
 Library: `github.com/juju/ratelimit` уже присутствует в дереве зависимостей сервера как транзитивная зависимость `xtls/reality`.
 
-### UDP associate
-
-Добавить обработку `CMD=0x03` в SOCKS5. Пробросить UDP-датаграммы через отдельный yamux-поток с инкапсуляцией `[4B length][payload]`.
 
