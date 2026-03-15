@@ -136,6 +136,7 @@ go build -o umbrella-client .
 | `--sni` | `cloudflare.com` | SNI в TLS ClientHello |
 | `--listen` | `127.0.0.1:1080` | Локальный SOCKS5 адрес |
 | `--udp` | `true` | Включить UDP ASSOCIATE; `false` = только TCP |
+| `--close-on-rotate` | `false` | Закрывать активные соединения при ротации сессии; `false` — оставить их до естественного завершения |
 
 ### Настройка браузера / системы
 

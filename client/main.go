@@ -25,11 +25,12 @@ import (
 
 // Global session state — all SOCKS5 connections share one TLS connection.
 var (
-	gServerAddr   string
-	gSNI          string
-	gServerPubKey []byte
-	gShortId      [8]byte
-	gUDPEnabled   bool
+	gServerAddr    string
+	gSNI           string
+	gServerPubKey  []byte
+	gShortId       [8]byte
+	gUDPEnabled    bool
+	gCloseOnRotate bool
 
 	sessMu sync.Mutex
 	sess   *yamux.Session
@@ -42,9 +43,11 @@ func main() {
 	sni := flag.String("sni", "cloudflare.com", "SNI to use in TLS Client Hello")
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "local SOCKS5 listen address")
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
+	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
 	flag.Parse()
 
 	gUDPEnabled = *udpEnabled
+	gCloseOnRotate = *closeOnRotate
 
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -225,7 +228,12 @@ func scheduleReconnect(s *yamux.Session) {
 	sessMu.Lock()
 	if sess == s {
 		sess = nil
-		log.Printf("Session rotated after %s — next request will reconnect", delay.Round(time.Second))
+		if gCloseOnRotate {
+			log.Printf("Session rotated after %s — closing active connections", delay.Round(time.Second))
+			go s.Close()
+		} else {
+			log.Printf("Session rotated after %s — next request will reconnect", delay.Round(time.Second))
+		}
 	}
 	sessMu.Unlock()
 }
