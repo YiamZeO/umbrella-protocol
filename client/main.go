@@ -30,6 +30,7 @@ var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return
 var (
 	gServerAddr    string
 	gSNI           string
+	gKeepAliveHost string
 	gServerPubKey  []byte
 	gShortId       [8]byte
 	gUDPEnabled    bool
@@ -47,6 +48,7 @@ func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:1080", "local SOCKS5 listen address")
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
+	keepAliveHost := flag.String("host-for-keep-alive", "", "host to use for keepalive probes (default: value of --sni)")
 	flag.Parse()
 
 	gUDPEnabled = *udpEnabled
@@ -74,6 +76,11 @@ func main() {
 
 	gServerAddr = *serverAddr
 	gSNI = *sni
+	if *keepAliveHost != "" {
+		gKeepAliveHost = *keepAliveHost
+	} else {
+		gKeepAliveHost = *sni
+	}
 	gServerPubKey = pubKey
 	copy(gShortId[:], shortIdBytes)
 
@@ -83,6 +90,8 @@ func main() {
 	}
 	log.Printf("Umbrella/REALITY client on %s (SOCKS5) → %s (SNI: %s)", *listenAddr, *serverAddr, *sni)
 
+	startKeepAlive()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -91,6 +100,25 @@ func main() {
 		}
 		go handleSocks5(conn)
 	}
+}
+
+// startKeepAlive runs a background goroutine that opens a probe stream to the
+// SNI host every 10 seconds. If the session has died (e.g. censorship reset),
+// openStream will detect the broken yamux session, clear it, and reconnect on
+// the second attempt — all without waiting for user traffic.
+func startKeepAlive() {
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			stream, err := openStream(gKeepAliveHost, 443)
+			if err != nil {
+				log.Printf("keepalive → %s: %v", gKeepAliveHost, err)
+				continue
+			}
+			log.Printf("keepalive → %s: ok", gKeepAliveHost)
+			stream.Close()
+		}
+	}()
 }
 
 // getSession returns the current multiplexed session, creating one if needed.
