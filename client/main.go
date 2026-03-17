@@ -507,10 +507,21 @@ func handleSocks5(conn net.Conn) {
 		return
 	}
 
-	stream, err := openStream(host, port)
+	// Use Vision framing for HTTPS (port 443) to mask the TLS-in-TLS fingerprint.
+	// A port heuristic is used instead of peeking at the first byte, because the
+	// SOCKS5 success reply must be sent before the application sends any data —
+	// peeking before the reply causes a deadlock that results in EOF.
+	useVision := port == 443
+
+	var stream net.Conn
+	if useVision {
+		stream, err = openVisionStream(host, port)
+	} else {
+		stream, err = openStream(host, port)
+	}
 	if err != nil {
 		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		log.Printf("Stream open error for %s:%d: %v", host, port, err)
+		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
 		return
 	}
 	defer stream.Close()
@@ -518,27 +529,48 @@ func handleSocks5(conn net.Conn) {
 	// Tell SOCKS5 client that connection succeeded
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	log.Printf("Tunneling %s → %s:%d", conn.RemoteAddr(), host, port)
+	log.Printf("Tunneling %s → %s:%d (vision=%v)", conn.RemoteAddr(), host, port, useVision)
 
 	done := make(chan struct{}, 2)
-	go func() {
-		b := copyBufPool.Get().(*[]byte)
-		var dst io.Writer = stream
-		if gSmartShaper {
-			dst = &shapedWriter{w: stream, bucket: &gUpBucket}
-		}
-		io.CopyBuffer(dst, conn, *b)
-		copyBufPool.Put(b)
-		closeWrite(stream)
-		done <- struct{}{}
-	}()
-	go func() {
-		b := copyBufPool.Get().(*[]byte)
-		io.CopyBuffer(conn, stream, *b)
-		copyBufPool.Put(b)
-		closeWrite(conn)
-		done <- struct{}{}
-	}()
+
+	if useVision {
+		// Vision mode: encode upload (app→stream), decode download (stream→app).
+		// SmartShaper upload throttle wraps the stream writer before passing to Vision.
+		go func() {
+			var dst io.Writer = stream
+			if gSmartShaper {
+				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
+			}
+			visionCopyToTunnel(dst, conn)
+			closeWrite(stream)
+			done <- struct{}{}
+		}()
+		go func() {
+			visionCopyFromTunnel(conn, stream)
+			closeWrite(conn)
+			done <- struct{}{}
+		}()
+	} else {
+		go func() {
+			b := copyBufPool.Get().(*[]byte)
+			var dst io.Writer = stream
+			if gSmartShaper {
+				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
+			}
+			io.CopyBuffer(dst, conn, *b)
+			copyBufPool.Put(b)
+			closeWrite(stream)
+			done <- struct{}{}
+		}()
+		go func() {
+			b := copyBufPool.Get().(*[]byte)
+			io.CopyBuffer(conn, stream, *b)
+			copyBufPool.Put(b)
+			closeWrite(conn)
+			done <- struct{}{}
+		}()
+	}
+
 	<-done
 	<-done
 }

@@ -155,6 +155,8 @@ func handleConn(conn net.Conn) {
 				streamErr = handleTunnel(s, shaper.Load())
 			case 0x01:
 				streamErr = handleUDPRelay(s)
+			case 0x03:
+				streamErr = handleVisionTunnel(s, shaper.Load())
 			case 0x02:
 				sh := &sessionShaper{}
 				shaper.Store(sh)
@@ -273,6 +275,90 @@ func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 	<-done
 	<-done
 
+	return nil
+}
+
+// handleVisionTunnel handles a Vision TCP tunnel stream (cmd=0x03).
+// Address parsing is identical to handleTunnel. After dialing the target,
+// upload direction (client→remote) is Vision-decoded (strip padding/sentinel),
+// download direction (remote→client) is Vision-encoded (add padding/sentinel).
+// SmartShaper ↓ throttle is applied on the download path via shaper.downWriter.
+func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
+	atyp := make([]byte, 1)
+	if _, err := io.ReadFull(conn, atyp); err != nil {
+		return fmt.Errorf("vision read atyp: %w", err)
+	}
+
+	var host string
+	switch atyp[0] {
+	case 0x01:
+		ip := make([]byte, 4)
+		if _, err := io.ReadFull(conn, ip); err != nil {
+			return fmt.Errorf("vision read IPv4: %w", err)
+		}
+		host = net.IP(ip).String()
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return fmt.Errorf("vision read domain length: %w", err)
+		}
+		domain := make([]byte, lenBuf[0])
+		if _, err := io.ReadFull(conn, domain); err != nil {
+			return fmt.Errorf("vision read domain: %w", err)
+		}
+		host = string(domain)
+	case 0x04:
+		ip := make([]byte, 16)
+		if _, err := io.ReadFull(conn, ip); err != nil {
+			return fmt.Errorf("vision read IPv6: %w", err)
+		}
+		host = net.IP(ip).String()
+	default:
+		conn.Write([]byte{0x01})
+		return fmt.Errorf("vision unsupported atyp: 0x%02x", atyp[0])
+	}
+
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBuf); err != nil {
+		return fmt.Errorf("vision read port: %w", err)
+	}
+	target := fmt.Sprintf("%s:%d", host, binary.BigEndian.Uint16(portBuf))
+
+	remote, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		conn.Write([]byte{0x01})
+		return fmt.Errorf("vision dial %s: %w", target, err)
+	}
+	defer remote.Close()
+
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		return fmt.Errorf("vision write ok: %w", err)
+	}
+
+	log.Printf("Vision proxying %s → %s", conn.RemoteAddr(), target)
+
+	done := make(chan struct{}, 2)
+
+	// Upload: client→remote — strip Vision framing, forward raw TLS to target.
+	go func() {
+		visionCopyFromTunnel(remote, conn)
+		closeWrite(remote)
+		done <- struct{}{}
+	}()
+
+	// Download: remote→client — add Vision framing, optional SmartShaper ↓ throttle.
+	go func() {
+		var dst io.Writer = conn
+		if shaper != nil {
+			dst = shaper.downWriter(conn)
+		}
+		visionCopyToTunnel(dst, remote)
+		closeWrite(conn)
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
 	return nil
 }
 
