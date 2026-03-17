@@ -14,6 +14,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -135,6 +136,7 @@ func handleConn(conn net.Conn) {
 	defer muxSess.Close()
 
 	log.Printf("Session from %s", conn.RemoteAddr())
+	var shaper atomic.Pointer[sessionShaper]
 	for {
 		stream, err := muxSess.Accept()
 		if err != nil {
@@ -150,9 +152,14 @@ func handleConn(conn net.Conn) {
 			var streamErr error
 			switch cmdBuf[0] {
 			case 0x00:
-				streamErr = handleTunnel(s)
+				streamErr = handleTunnel(s, shaper.Load())
 			case 0x01:
 				streamErr = handleUDPRelay(s)
+			case 0x02:
+				sh := &sessionShaper{}
+				shaper.Store(sh)
+				sh.runPhaseEngine(s)
+				return
 			default:
 				log.Printf("unknown stream cmd 0x%02x from %s", cmdBuf[0], conn.RemoteAddr())
 				return
@@ -186,7 +193,7 @@ func closeWrite(c net.Conn) {
 //	0x04 — IPv6  (16 bytes)
 //
 // Response: [1 byte: 0x00 = ok, 0x01 = error]
-func handleTunnel(conn net.Conn) error {
+func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 	// Read address type
 	atyp := make([]byte, 1)
 	if _, err := io.ReadFull(conn, atyp); err != nil {
@@ -254,7 +261,11 @@ func handleTunnel(conn net.Conn) error {
 	}()
 	go func() {
 		b := copyBufPool.Get().(*[]byte)
-		io.CopyBuffer(conn, remote, *b)
+		var dst io.Writer = conn
+		if shaper != nil {
+			dst = shaper.downWriter(conn)
+		}
+		io.CopyBuffer(dst, remote, *b)
 		copyBufPool.Put(b)
 		closeWrite(conn)
 		done <- struct{}{}

@@ -35,6 +35,7 @@ var (
 	gShortId       [8]byte
 	gUDPEnabled    bool
 	gCloseOnRotate bool
+	gSmartShaper   bool
 
 	sessMu sync.Mutex
 	sess   *yamux.Session
@@ -49,10 +50,12 @@ func main() {
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
 	keepAliveHost := flag.String("host-for-keep-alive", "", "host to use for keepalive probes (default: value of --sni)")
+	smartShaper := flag.Bool("smart-shaper", false, "enable SmartShaper behavioural traffic shaping")
 	flag.Parse()
 
 	gUDPEnabled = *udpEnabled
 	gCloseOnRotate = *closeOnRotate
+	gSmartShaper = *smartShaper
 
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -240,6 +243,16 @@ func getSession() (*yamux.Session, error) {
 
 	sess = newSess
 	go scheduleReconnect(newSess)
+	if gSmartShaper {
+		if ctrlStream, err := newSess.Open(); err == nil {
+			if _, err := ctrlStream.Write([]byte{0x02}); err == nil {
+				go readPhaseUpdates(ctrlStream)
+			} else {
+				ctrlStream.Close()
+			}
+		}
+	}
+
 	log.Printf("REALITY session established to %s", gServerAddr)
 	return sess, nil
 }
@@ -506,7 +519,11 @@ func handleSocks5(conn net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
 		b := copyBufPool.Get().(*[]byte)
-		io.CopyBuffer(stream, conn, *b)
+		var dst io.Writer = stream
+		if gSmartShaper {
+			dst = &shapedWriter{w: stream, bucket: &gUpBucket}
+		}
+		io.CopyBuffer(dst, conn, *b)
 		copyBufPool.Put(b)
 		closeWrite(stream)
 		done <- struct{}{}
