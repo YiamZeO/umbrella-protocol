@@ -13,11 +13,15 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/xtls/reality"
 )
+
+// copyBufPool holds reusable 32 KiB buffers for bidirectional TCP proxying.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
 
 func main() {
 	port := flag.String("port", "443", "listening port")
@@ -121,7 +125,9 @@ func main() {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	muxSess, err := yamux.Server(conn, nil)
+	muxCfg := yamux.DefaultConfig()
+	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
+	muxSess, err := yamux.Server(conn, muxCfg)
 	if err != nil {
 		log.Printf("yamux server %s: %v", conn.RemoteAddr(), err)
 		return
@@ -155,6 +161,15 @@ func handleConn(conn net.Conn) {
 				log.Printf("stream error from %s: %v", conn.RemoteAddr(), streamErr)
 			}
 		}(stream)
+	}
+}
+
+// closeWrite signals the write-half of a connection is done, allowing the remote
+// to flush any remaining data before the connection is fully torn down.
+func closeWrite(c net.Conn) {
+	type halfCloser interface{ CloseWrite() error }
+	if hc, ok := c.(halfCloser); ok {
+		hc.CloseWrite()
 	}
 }
 
@@ -228,16 +243,23 @@ func handleTunnel(conn net.Conn) error {
 
 	log.Printf("Proxying %s → %s", conn.RemoteAddr(), target)
 
-	// Bidirectional copy
+	// Bidirectional copy with half-close so each side can flush remaining data.
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(remote, conn)
+		b := copyBufPool.Get().(*[]byte)
+		io.CopyBuffer(remote, conn, *b)
+		copyBufPool.Put(b)
+		closeWrite(remote)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(conn, remote)
+		b := copyBufPool.Get().(*[]byte)
+		io.CopyBuffer(conn, remote, *b)
+		copyBufPool.Put(b)
+		closeWrite(conn)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 
 	return nil
@@ -262,6 +284,8 @@ func handleUDPRelay(stream net.Conn) error {
 	// Stream → UDP: parse length-prefixed frames and dispatch to target.
 	go func() {
 		lenBuf := make([]byte, 4)
+		addrCache := make(map[string]*net.UDPAddr)
+		payloadBuf := make([]byte, 65535) // persistent read buffer; reused each iteration
 		for {
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
 				pc.Close()
@@ -272,7 +296,7 @@ func handleUDPRelay(stream net.Conn) error {
 				pc.Close()
 				return
 			}
-			payload := make([]byte, payloadLen)
+			payload := payloadBuf[:payloadLen] // reuse persistent buffer
 			if _, err := io.ReadFull(stream, payload); err != nil {
 				pc.Close()
 				return
@@ -314,10 +338,15 @@ func handleUDPRelay(stream net.Conn) error {
 			port := binary.BigEndian.Uint16(payload[addrEnd : addrEnd+2])
 			data := payload[addrEnd+2:]
 			target := fmt.Sprintf("%s:%d", host, port)
-			addr, err := net.ResolveUDPAddr("udp", target)
-			if err != nil {
-				log.Printf("UDP relay: resolve %s: %v", target, err)
-				continue
+			addr, ok := addrCache[target]
+			if !ok {
+				var err error
+				addr, err = net.ResolveUDPAddr("udp", target)
+				if err != nil {
+					log.Printf("UDP relay: resolve %s: %v", target, err)
+					continue
+				}
+				addrCache[target] = addr
 			}
 			pc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := pc.WriteTo(data, addr); err != nil {
@@ -328,6 +357,7 @@ func handleUDPRelay(stream net.Conn) error {
 
 	// UDP → Stream: receive responses and forward to client as length-prefixed frames.
 	buf := make([]byte, 65535)
+	frameBuf := make([]byte, 4+1+16+2+65535) // persistent: [4B len][ATYP+IP+PORT][data]
 	for {
 		pc.SetReadDeadline(time.Now().Add(idleTimeout))
 		n, addr, err := pc.ReadFrom(buf)
@@ -335,21 +365,26 @@ func handleUDPRelay(stream net.Conn) error {
 			return nil // idle timeout or PacketConn closed
 		}
 		udpAddr := addr.(*net.UDPAddr)
-		var addrBytes []byte
+		// Build frame directly into persistent buffer: [4B len][ATYP+IP+PORT][data]
+		off := 4 // reserve first 4 bytes for length prefix
 		if ip4 := udpAddr.IP.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
+			frameBuf[off] = 0x01
+			copy(frameBuf[off+1:], ip4)
+			off += 5
 		} else {
-			addrBytes = append([]byte{0x04}, udpAddr.IP.To16()...)
+			frameBuf[off] = 0x04
+			copy(frameBuf[off+1:], udpAddr.IP.To16())
+			off += 17
 		}
-		addrBytes = append(addrBytes, byte(udpAddr.Port>>8), byte(udpAddr.Port))
-		payload := append(addrBytes, buf[:n]...)
-
-		frame := make([]byte, 4+len(payload))
-		binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
-		copy(frame[4:], payload)
+		frameBuf[off] = byte(udpAddr.Port >> 8)
+		frameBuf[off+1] = byte(udpAddr.Port)
+		off += 2
+		copy(frameBuf[off:], buf[:n])
+		off += n
+		binary.BigEndian.PutUint32(frameBuf[:4], uint32(off-4))
 
 		stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := stream.Write(frame); err != nil {
+		if _, err := stream.Write(frameBuf[:off]); err != nil {
 			return fmt.Errorf("write UDP frame: %w", err)
 		}
 	}

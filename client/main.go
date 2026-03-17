@@ -23,6 +23,9 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// copyBufPool holds reusable 32 KiB buffers for bidirectional TCP proxying.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+
 // Global session state — all SOCKS5 connections share one TLS connection.
 var (
 	gServerAddr    string
@@ -199,7 +202,9 @@ func getSession() (*yamux.Session, error) {
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 
-	newSess, err := yamux.Client(uConn, nil)
+	muxCfg := yamux.DefaultConfig()
+	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
+	newSess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("yamux client: %w", err)
@@ -373,6 +378,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 	// and forward [ATYP+ADDR+PORT+DATA] as length-prefixed frames over the relay stream.
 	go func() {
 		buf := make([]byte, 65535)
+		frameBuf := make([]byte, 4+65535) // persistent frame buffer: [4B len][payload]
 		for {
 			n, addr, err := udpConn.ReadFrom(buf)
 			if err != nil {
@@ -386,11 +392,11 @@ func handleSocks5UDP(tcpConn net.Conn) {
 				continue
 			}
 			payload := buf[3:n] // ATYP + ADDR + PORT + DATA
-			frame := make([]byte, 4+len(payload))
-			binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
-			copy(frame[4:], payload)
+			// Reuse persistent frame buffer: [4B len][payload]
+			binary.BigEndian.PutUint32(frameBuf[:4], uint32(len(payload)))
+			copy(frameBuf[4:], payload)
 			stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := stream.Write(frame); err != nil {
+			if _, err := stream.Write(frameBuf[:4+len(payload)]); err != nil {
 				return
 			}
 		}
@@ -400,6 +406,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 	// and send to the app's UDP address.
 	go func() {
 		lenBuf := make([]byte, 4)
+		pktBuf := make([]byte, 3+65535) // persistent: [RSV(2)+FRAG(1)][payload up to 65535]
 		for {
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
 				udpConn.Close()
@@ -410,7 +417,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 				udpConn.Close()
 				return
 			}
-			payload := make([]byte, payloadLen)
+			payload := pktBuf[3 : 3+payloadLen] // read directly into pktBuf after the SOCKS5 header
 			if _, err := io.ReadFull(stream, payload); err != nil {
 				udpConn.Close()
 				return
@@ -422,15 +429,22 @@ func handleSocks5UDP(tcpConn net.Conn) {
 				continue
 			}
 			// SOCKS5 UDP datagram: RSV(2)+FRAG(1)+[ATYP+ADDR+PORT+DATA]
-			pkt := make([]byte, 3+len(payload))
-			pkt[0], pkt[1], pkt[2] = 0, 0, 0
-			copy(pkt[3:], payload)
-			udpConn.WriteTo(pkt, a)
+			// Header bytes are already zero from make; payload already at pktBuf[3:].
+			udpConn.WriteTo(pktBuf[:3+payloadLen], a)
 		}
 	}()
 
 	// The association stays alive as long as the TCP control connection is open (RFC 1928).
 	io.Copy(io.Discard, tcpConn)
+}
+
+// closeWrite signals the write-half of a connection is done, allowing the remote
+// to flush any remaining data before the connection is fully torn down.
+func closeWrite(c net.Conn) {
+	type halfCloser interface{ CloseWrite() error }
+	if hc, ok := c.(halfCloser); ok {
+		hc.CloseWrite()
+	}
 }
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
@@ -463,13 +477,20 @@ func handleSocks5(conn net.Conn) {
 
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(stream, conn)
+		b := copyBufPool.Get().(*[]byte)
+		io.CopyBuffer(stream, conn, *b)
+		copyBufPool.Put(b)
+		closeWrite(stream)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(conn, stream)
+		b := copyBufPool.Get().(*[]byte)
+		io.CopyBuffer(conn, stream, *b)
+		copyBufPool.Put(b)
+		closeWrite(conn)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 }
 
