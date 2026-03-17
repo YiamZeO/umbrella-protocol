@@ -172,7 +172,7 @@ go build -o umbrella-client .
 | `--udp` | `true` | Включить UDP ASSOCIATE; `false` = только TCP |
 | `--close-on-rotate` | `false` | Закрывать активные соединения при ротации сессии; `false` — оставить их до естественного завершения |
 | `--host-for-keep-alive` | значение `--sni` | Хост для keepalive-зондов (каждые 10 сек); если не указан — используется `--sni` |
-| `--smart-shaper` | `false` | Включить SmartShaper — поведенческий shaping трафика (token-bucket, фазы задаёт сервер) |
+| `--smart-shaper` | `false` | Включить SmartShaper — поведенческий shaping трафика (token-bucket, фазы задаёт сервер). **Требует `--close-on-rotate`** |
 
 ### Настройка браузера / системы
 

@@ -57,6 +57,10 @@ func main() {
 	gCloseOnRotate = *closeOnRotate
 	gSmartShaper = *smartShaper
 
+	if *smartShaper && !*closeOnRotate {
+		log.Fatal("--smart-shaper requires --close-on-rotate: without it multiple shapers from overlapping sessions will fight over the global throttle")
+	}
+
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
 	}
