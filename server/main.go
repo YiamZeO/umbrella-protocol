@@ -235,7 +235,7 @@ func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
 		return fmt.Errorf("read port: %w", err)
 	}
-	target := fmt.Sprintf("%s:%d", host, binary.BigEndian.Uint16(portBuf))
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", binary.BigEndian.Uint16(portBuf)))
 
 	// Connect to destination
 	remote, err := net.DialTimeout("tcp", target, 10*time.Second)
@@ -322,7 +322,7 @@ func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
 		return fmt.Errorf("vision read port: %w", err)
 	}
-	target := fmt.Sprintf("%s:%d", host, binary.BigEndian.Uint16(portBuf))
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", binary.BigEndian.Uint16(portBuf)))
 
 	remote, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
@@ -434,7 +434,7 @@ func handleUDPRelay(stream net.Conn) error {
 			}
 			port := binary.BigEndian.Uint16(payload[addrEnd : addrEnd+2])
 			data := payload[addrEnd+2:]
-			target := fmt.Sprintf("%s:%d", host, port)
+			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 			addr, ok := addrCache[target]
 			if !ok {
 				var err error
