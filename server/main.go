@@ -128,6 +128,10 @@ func handleConn(conn net.Conn) {
 
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
+	// Telegram relies on long-lived idle connections for push events.
+	muxCfg.EnableKeepAlive = true
+	muxCfg.KeepAliveInterval = 5 * time.Minute
+	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
 	muxSess, err := yamux.Server(conn, muxCfg)
 	if err != nil {
 		log.Printf("yamux server %s: %v", conn.RemoteAddr(), err)

@@ -239,6 +239,10 @@ func getSession() (*yamux.Session, error) {
 
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
+	// Telegram relies on long-lived idle connections for push events.
+	muxCfg.EnableKeepAlive = true
+	muxCfg.KeepAliveInterval = 5 * time.Minute
+	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
 	newSess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
 		uConn.Close()
@@ -507,11 +511,19 @@ func handleSocks5(conn net.Conn) {
 		return
 	}
 
-	// Use Vision framing for HTTPS (port 443) to mask the TLS-in-TLS fingerprint.
-	// A port heuristic is used instead of peeking at the first byte, because the
-	// SOCKS5 success reply must be sent before the application sends any data —
-	// peeking before the reply causes a deadlock that results in EOF.
-	useVision := port == 443
+	// Tell SOCKS5 client that connection succeeded BEFORE opening the stream
+	// so that the client sends its first data payload, allowing us to peek it.
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+	// Peek the first byte from the client application.
+	pc, firstByte, err := peekOneByte(conn)
+	if err != nil {
+		log.Printf("Failed to peek first byte from %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	// Use Vision framing if it looks like a TLS handshake (0x16).
+	useVision := firstByte == 0x16
 
 	var stream net.Conn
 	if useVision {
@@ -520,14 +532,10 @@ func handleSocks5(conn net.Conn) {
 		stream, err = openStream(host, port)
 	}
 	if err != nil {
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
 		return
 	}
 	defer stream.Close()
-
-	// Tell SOCKS5 client that connection succeeded
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	log.Printf("Tunneling %s → %s:%d (vision=%v)", conn.RemoteAddr(), host, port, useVision)
 
@@ -541,13 +549,13 @@ func handleSocks5(conn net.Conn) {
 			if gSmartShaper {
 				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
 			}
-			visionCopyToTunnel(dst, conn)
+			visionCopyToTunnel(dst, pc)
 			closeWrite(stream)
 			done <- struct{}{}
 		}()
 		go func() {
-			visionCopyFromTunnel(conn, stream)
-			closeWrite(conn)
+			visionCopyFromTunnel(pc, stream)
+			closeWrite(pc)
 			done <- struct{}{}
 		}()
 	} else {
@@ -557,16 +565,16 @@ func handleSocks5(conn net.Conn) {
 			if gSmartShaper {
 				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
 			}
-			io.CopyBuffer(dst, conn, *b)
+			io.CopyBuffer(dst, pc, *b)
 			copyBufPool.Put(b)
 			closeWrite(stream)
 			done <- struct{}{}
 		}()
 		go func() {
 			b := copyBufPool.Get().(*[]byte)
-			io.CopyBuffer(conn, stream, *b)
+			io.CopyBuffer(pc, stream, *b)
 			copyBufPool.Put(b)
-			closeWrite(conn)
+			closeWrite(pc)
 			done <- struct{}{}
 		}()
 	}
