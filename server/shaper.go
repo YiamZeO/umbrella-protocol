@@ -31,7 +31,6 @@ type Phase struct {
 //	api_call  — short XHR/fetch request
 //	upload    — user uploading a file or photo
 var Phases = []Phase{
-	{"idle", 1 * time.Second, 2 * time.Second, 0.0, 0.0},
 	{"page_load", 1 * time.Second, 4 * time.Second, 12.0, 0.8},
 	{"images", 1 * time.Second, 4 * time.Second, 6.0, 0.1},
 	{"api_call", 500 * time.Millisecond, 2 * time.Second, 0.4, 0.3},

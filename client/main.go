@@ -28,14 +28,14 @@ var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return
 
 // Global session state — all SOCKS5 connections share one TLS connection.
 var (
-	gServerAddr    string
-	gSNI           string
-	gKeepAliveHost string
-	gServerPubKey  []byte
-	gShortId       [8]byte
-	gUDPEnabled    bool
-	gCloseOnRotate bool
-	gSmartShaper   bool
+	gServerAddr         string
+	gSNI                string
+	gServerPubKey       []byte
+	gShortId            [8]byte
+	gUDPEnabled         bool
+	gCloseOnRotate      bool
+	gShaper        bool
+	gConnectionsTimeOut time.Duration
 
 	sessMu sync.Mutex
 	sess   *yamux.Session
@@ -46,19 +46,20 @@ func main() {
 	publicKeyB64 := flag.String("public-key", "", "server x25519 public key in base64 (required)")
 	shortIdHex := flag.String("short-id", "", "Reality short ID in hex, up to 16 chars (required)")
 	sni := flag.String("sni", "cloudflare.com", "SNI to use in TLS Client Hello")
-	listenAddr := flag.String("listen", "127.0.0.1:1080", "local SOCKS5 listen address")
+	listenAddr := flag.String("listen", "0.0.0.0:1080", "local SOCKS5 listen address")
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
-	keepAliveHost := flag.String("host-for-keep-alive", "", "host to use for keepalive probes (default: value of --sni)")
-	smartShaper := flag.Bool("smart-shaper", false, "enable SmartShaper behavioural traffic shaping")
+	shaper := flag.Bool("shaper", false, "enable Shaper behavioural traffic shaping")
+	connTimeout := flag.Int("connections-time-out", 300, "close connection if idle > timeout seconds (0 to disable)")
 	flag.Parse()
 
 	gUDPEnabled = *udpEnabled
 	gCloseOnRotate = *closeOnRotate
-	gSmartShaper = *smartShaper
+	gShaper = *shaper
+	gConnectionsTimeOut = time.Duration(*connTimeout) * time.Second
 
-	if *smartShaper && !*closeOnRotate {
-		log.Fatal("--smart-shaper requires --close-on-rotate: without it multiple shapers from overlapping sessions will fight over the global throttle")
+	if *shaper && !*closeOnRotate {
+		log.Fatal("--shaper requires --close-on-rotate: without it multiple shapers from overlapping sessions will fight over the global throttle")
 	}
 
 	if *serverAddr == "" {
@@ -83,11 +84,6 @@ func main() {
 
 	gServerAddr = *serverAddr
 	gSNI = *sni
-	if *keepAliveHost != "" {
-		gKeepAliveHost = *keepAliveHost
-	} else {
-		gKeepAliveHost = *sni
-	}
 	gServerPubKey = pubKey
 	copy(gShortId[:], shortIdBytes)
 
@@ -97,8 +93,6 @@ func main() {
 	}
 	log.Printf("Umbrella/REALITY client on %s (SOCKS5) → %s (SNI: %s)", *listenAddr, *serverAddr, *sni)
 
-	startKeepAlive()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -107,25 +101,6 @@ func main() {
 		}
 		go handleSocks5(conn)
 	}
-}
-
-// startKeepAlive runs a background goroutine that opens a probe stream to the
-// SNI host every 10 seconds. If the session has died (e.g. censorship reset),
-// openStream will detect the broken yamux session, clear it, and reconnect on
-// the second attempt — all without waiting for user traffic.
-func startKeepAlive() {
-	go func() {
-		for {
-			time.Sleep(10 * time.Second)
-			stream, err := openStream(gKeepAliveHost, 443)
-			if err != nil {
-				log.Printf("keepalive → %s: %v", gKeepAliveHost, err)
-				continue
-			}
-			log.Printf("keepalive → %s: ok", gKeepAliveHost)
-			stream.Close()
-		}
-	}()
 }
 
 // getSession returns the current multiplexed session, creating one if needed.
@@ -241,7 +216,8 @@ func getSession() (*yamux.Session, error) {
 	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
 	// Telegram relies on long-lived idle connections for push events.
 	muxCfg.EnableKeepAlive = true
-	muxCfg.KeepAliveInterval = 5 * time.Minute
+	muxCfg.KeepAliveInterval = 10 * time.Second
+	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
 	newSess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
@@ -251,7 +227,7 @@ func getSession() (*yamux.Session, error) {
 
 	sess = newSess
 	go scheduleReconnect(newSess)
-	if gSmartShaper {
+	if gShaper {
 		if ctrlStream, err := newSess.Open(); err == nil {
 			if _, err := ctrlStream.Write([]byte{0x02}); err == nil {
 				go readPhaseUpdates(ctrlStream)
@@ -290,6 +266,49 @@ func scheduleReconnect(s *yamux.Session) {
 		}
 	}
 	sessMu.Unlock()
+}
+
+// dropStalledSession kills the active session if a stream exceeds the idle timeout.
+func dropStalledSession(s *yamux.Session) {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	if sess == s {
+		log.Printf("Session stalled during handshake, dropping to refresh connection")
+		sess = nil
+		s.Close()
+	}
+}
+
+type timeoutStream struct {
+	net.Conn
+}
+
+func (ts *timeoutStream) Read(p []byte) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	n, err = ts.Conn.Read(p)
+	if err != nil && gConnectionsTimeOut > 0 {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			ts.Conn.Close()
+			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
+		}
+	}
+	return
+}
+
+func (ts *timeoutStream) Write(p []byte) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.Conn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	n, err = ts.Conn.Write(p)
+	if err != nil && gConnectionsTimeOut > 0 {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			ts.Conn.Close()
+			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
+		}
+	}
+	return
 }
 
 // openStream opens a new yamux stream and sends the tunnel destination.
@@ -335,6 +354,9 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 
 		req := append([]byte{0x00}, addrBytes...)
 		req = append(req, portBytes[:]...)
+		if gConnectionsTimeOut > 0 {
+			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := stream.Write(req); err != nil {
 			stream.Close()
 			return nil, fmt.Errorf("write tunnel request: %w", err)
@@ -342,8 +364,14 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 
 		// Read server response: 0x00 = ok, 0x01 = error
 		var respBuf [1]byte
+		if gConnectionsTimeOut > 0 {
+			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
 			stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("read tunnel response: %w", err)
 		}
 		if respBuf[0] != 0x00 {
@@ -351,7 +379,7 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 			return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
 		}
 
-		return stream, nil
+		return &timeoutStream{Conn: stream}, nil
 	}
 	return nil, fmt.Errorf("failed to open stream after retry")
 }
@@ -372,20 +400,29 @@ func openUDPStream() (net.Conn, error) {
 			sessMu.Unlock()
 			continue
 		}
+		if gConnectionsTimeOut > 0 {
+			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := stream.Write([]byte{0x01}); err != nil {
 			stream.Close()
 			return nil, fmt.Errorf("write UDP cmd: %w", err)
 		}
 		var ack [1]byte
+		if gConnectionsTimeOut > 0 {
+			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := io.ReadFull(stream, ack[:]); err != nil {
 			stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("read UDP ack: %w", err)
 		}
 		if ack[0] != 0x00 {
 			stream.Close()
 			return nil, fmt.Errorf("server rejected UDP relay")
 		}
-		return stream, nil
+		return &timeoutStream{Conn: stream}, nil
 	}
 	return nil, fmt.Errorf("failed to open UDP stream after retry")
 }
@@ -543,10 +580,10 @@ func handleSocks5(conn net.Conn) {
 
 	if useVision {
 		// Vision mode: encode upload (app→stream), decode download (stream→app).
-		// SmartShaper upload throttle wraps the stream writer before passing to Vision.
+		// Shaper upload throttle wraps the stream writer before passing to Vision.
 		go func() {
 			var dst io.Writer = stream
-			if gSmartShaper {
+			if gShaper {
 				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
 			}
 			visionCopyToTunnel(dst, pc)
@@ -562,7 +599,7 @@ func handleSocks5(conn net.Conn) {
 		go func() {
 			b := copyBufPool.Get().(*[]byte)
 			var dst io.Writer = stream
-			if gSmartShaper {
+			if gShaper {
 				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
 			}
 			io.CopyBuffer(dst, pc, *b)

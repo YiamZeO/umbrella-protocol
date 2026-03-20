@@ -130,7 +130,8 @@ func handleConn(conn net.Conn) {
 	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
 	// Telegram relies on long-lived idle connections for push events.
 	muxCfg.EnableKeepAlive = true
-	muxCfg.KeepAliveInterval = 5 * time.Minute
+	muxCfg.KeepAliveInterval = 10 * time.Second
+	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
 	muxSess, err := yamux.Server(conn, muxCfg)
 	if err != nil {
@@ -286,7 +287,7 @@ func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 // Address parsing is identical to handleTunnel. After dialing the target,
 // upload direction (client→remote) is Vision-decoded (strip padding/sentinel),
 // download direction (remote→client) is Vision-encoded (add padding/sentinel).
-// SmartShaper ↓ throttle is applied on the download path via shaper.downWriter.
+// Shaper ↓ throttle is applied on the download path via shaper.downWriter.
 func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
 	atyp := make([]byte, 1)
 	if _, err := io.ReadFull(conn, atyp); err != nil {
@@ -350,7 +351,7 @@ func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
 		done <- struct{}{}
 	}()
 
-	// Download: remote→client — add Vision framing, optional SmartShaper ↓ throttle.
+	// Download: remote→client — add Vision framing, optional Shaper ↓ throttle.
 	go func() {
 		var dst io.Writer = conn
 		if shaper != nil {
