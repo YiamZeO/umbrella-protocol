@@ -231,3 +231,7 @@ go build -o umbrella-client .
 
 - Windows: запускаю `client`, использую Clash Verge в режиме TUN.
 - Android: запускаю `client` через Termux, на устройстве включаю VPN через Clash Meta.
+
+## З.Ы.
+
+В России ютюбчик, дискордик и телега работают с кайфом
