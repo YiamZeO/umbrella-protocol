@@ -34,7 +34,7 @@ var (
 	gShortId            [8]byte
 	gUDPEnabled         bool
 	gCloseOnRotate      bool
-	gShaper        bool
+	gShaper             bool
 	gConnectionsTimeOut time.Duration
 
 	sessMu sync.Mutex
@@ -50,6 +50,7 @@ func main() {
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
 	shaper := flag.Bool("shaper", false, "enable Shaper behavioural traffic shaping")
+	decoyTraffic := flag.Bool("decoy-traffic", false, "enable decoy traffic to blur traffic pattern")
 	connTimeout := flag.Int("connections-time-out", 300, "close connection if idle > timeout seconds (0 to disable)")
 	flag.Parse()
 
@@ -92,6 +93,10 @@ func main() {
 		log.Fatalf("Failed to listen on %s: %v", *listenAddr, err)
 	}
 	log.Printf("Umbrella/REALITY client on %s (SOCKS5) → %s (SNI: %s)", *listenAddr, *serverAddr, *sni)
+
+	if *decoyTraffic {
+		go runDecoyTraffic(*listenAddr)
+	}
 
 	for {
 		conn, err := ln.Accept()
