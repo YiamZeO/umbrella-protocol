@@ -223,7 +223,7 @@ func getSession() (*yamux.Session, error) {
 	muxCfg.EnableKeepAlive = true
 	muxCfg.KeepAliveInterval = 10 * time.Second
 	muxCfg.StreamCloseTimeout = 10 * time.Second
-	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
+	muxCfg.ConnectionWriteTimeout = 5 * time.Minute
 	newSess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
 		uConn.Close()
@@ -364,6 +364,9 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 		}
 		if _, err := stream.Write(req); err != nil {
 			stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("write tunnel request: %w", err)
 		}
 

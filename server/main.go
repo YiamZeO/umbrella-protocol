@@ -132,7 +132,7 @@ func handleConn(conn net.Conn) {
 	muxCfg.EnableKeepAlive = true
 	muxCfg.KeepAliveInterval = 10 * time.Second
 	muxCfg.StreamCloseTimeout = 10 * time.Second
-	muxCfg.ConnectionWriteTimeout = 30 * time.Minute
+	muxCfg.ConnectionWriteTimeout = 5 * time.Minute
 	muxSess, err := yamux.Server(conn, muxCfg)
 	if err != nil {
 		log.Printf("yamux server %s: %v", conn.RemoteAddr(), err)
