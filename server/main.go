@@ -390,17 +390,17 @@ func handleUDPRelay(stream net.Conn) error {
 		payloadBuf := make([]byte, 65535) // persistent read buffer; reused each iteration
 		for {
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
-				pc.Close()
+				go pc.Close()
 				return
 			}
 			payloadLen := binary.BigEndian.Uint32(lenBuf)
 			if payloadLen > 65535 {
-				pc.Close()
+				go pc.Close()
 				return
 			}
 			payload := payloadBuf[:payloadLen] // reuse persistent buffer
 			if _, err := io.ReadFull(stream, payload); err != nil {
-				pc.Close()
+				go pc.Close()
 				return
 			}
 			if len(payload) < 4 {

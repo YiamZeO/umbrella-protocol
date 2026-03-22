@@ -108,6 +108,17 @@ var decoyTargets = []string{
 	"https://picsum.photos/id/108/200/300",
 	"https://picsum.photos/id/109/200/300",
 	"https://picsum.photos/id/110/200/300",
+	// === HEAVY DOWNLOADS (10 шт — 100-200MB файлы) ===
+	"https://speed.hetzner.de/100MB.bin",
+	"https://download.thinkbroadband.com/100MB.zip",
+	"https://download.thinkbroadband.com/200MB.zip",
+	"https://testfiledownload.com/wp-content/uploads/2020/06/100MB.zip",
+	"https://testfiledownload.com/wp-content/uploads/2020/06/200MB.zip",
+	"https://speedtest.newark.linode.com/100MB-newark.bin",
+	"https://speedtest.atlanta.linode.com/100MB-atlanta.bin",
+	"https://speedtest.london.linode.com/100MB-london.bin",
+	"https://speedtest.frankfurt.linode.com/100MB-frankfurt.bin",
+	"https://speedtest.singapore.linode.com/100MB-singapore.bin",
 }
 
 func runDecoyTraffic(listenAddr string) {
@@ -150,7 +161,7 @@ func runDecoyTraffic(listenAddr string) {
 		log.Printf("[decoy] -> %s", target)
 		resp, err := client.Get(target)
 		if err == nil {
-			resp.Body.Close()
+			go resp.Body.Close()
 		} else {
 			log.Printf("[decoy] ERR decoy %s: %v", target, err)
 		}

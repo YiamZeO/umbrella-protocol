@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 )
 
 // Vision — слой фрейминга поверх yamux-потока, скрывающий сигнатуру TLS-in-TLS.
@@ -196,11 +197,13 @@ func openVisionStream(destHost string, destPort uint16) (net.Conn, error) {
 
 		stream, err := s.Open()
 		if err != nil {
-			sessMu.Lock()
-			if sess == s {
-				sess = nil
+			for i := 0; i < gSessionsNum; i++ {
+				sessMu[i].Lock()
+				if sessions[i] == s {
+					sessions[i] = nil
+				}
+				sessMu[i].Unlock()
 			}
-			sessMu.Unlock()
 			continue
 		}
 
@@ -214,7 +217,7 @@ func openVisionStream(destHost string, destPort uint16) (net.Conn, error) {
 			}
 		} else {
 			if len(destHost) > 255 {
-				stream.Close()
+				go stream.Close()
 				return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
 			}
 			addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
@@ -225,22 +228,34 @@ func openVisionStream(destHost string, destPort uint16) (net.Conn, error) {
 
 		req := append([]byte{0x03}, addrBytes...) // cmd = 0x03 (Vision)
 		req = append(req, portBytes[:]...)
+		if gConnectionsTimeOut > 0 {
+			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := stream.Write(req); err != nil {
-			stream.Close()
+			go stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("write vision request: %w", err)
 		}
 
 		var respBuf [1]byte
+		if gConnectionsTimeOut > 0 {
+			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+		}
 		if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
-			stream.Close()
+			go stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("read vision response: %w", err)
 		}
 		if respBuf[0] != 0x00 {
-			stream.Close()
+			go stream.Close()
 			return nil, fmt.Errorf("server rejected vision connection to %s:%d", destHost, destPort)
 		}
 
-		return stream, nil
+		return &timeoutStream{Conn: stream}, nil
 	}
 	return nil, fmt.Errorf("failed to open vision stream after retry")
 }

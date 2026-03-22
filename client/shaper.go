@@ -98,7 +98,7 @@ func cancelCurrentPhase() {
 // The client sets a local timer for duration_ms; when it fires, the bucket is cleared
 // and uploads fall back to default (no throttle). A new phase message cancels the previous timer.
 func readPhaseUpdates(controlStream io.ReadCloser) {
-	defer controlStream.Close()
+	defer func() { go controlStream.Close() }()
 	buf := make([]byte, 12)
 	for {
 		if _, err := io.ReadFull(controlStream, buf); err != nil {

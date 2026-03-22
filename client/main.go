@@ -15,6 +15,8 @@ import (
 	"io"
 	"log"
 	"math/big"
+	mrand "math/rand"
+	
 	"net"
 	"sync"
 	"time"
@@ -36,9 +38,10 @@ var (
 	gCloseOnRotate      bool
 	gShaper             bool
 	gConnectionsTimeOut time.Duration
+	gSessionsNum        int
 
-	sessMu sync.Mutex
-	sess   *yamux.Session
+	sessMu   []sync.Mutex
+	sessions []*yamux.Session
 )
 
 func main() {
@@ -52,12 +55,21 @@ func main() {
 	shaper := flag.Bool("shaper", false, "enable Shaper behavioural traffic shaping")
 	decoyTraffic := flag.Bool("decoy-traffic", false, "enable decoy traffic to blur traffic pattern")
 	connTimeout := flag.Int("connections-time-out", 300, "close connection if idle > timeout seconds (0 to disable)")
+	sessionsNum := flag.Int("sessions-num", 5, "number of multiplexed sessions to pool (default 5)")
 	flag.Parse()
+
+	mrand.Seed(time.Now().UnixNano())
 
 	gUDPEnabled = *udpEnabled
 	gCloseOnRotate = *closeOnRotate
 	gShaper = *shaper
 	gConnectionsTimeOut = time.Duration(*connTimeout) * time.Second
+	gSessionsNum = *sessionsNum
+	if gSessionsNum < 1 {
+		gSessionsNum = 1
+	}
+	sessMu = make([]sync.Mutex, gSessionsNum)
+	sessions = make([]*yamux.Session, gSessionsNum)
 
 	if *shaper && !*closeOnRotate {
 		log.Fatal("--shaper requires --close-on-rotate: without it multiple shapers from overlapping sessions will fight over the global throttle")
@@ -108,17 +120,18 @@ func main() {
 	}
 }
 
-// getSession returns the current multiplexed session, creating one if needed.
-// All SOCKS5 connections share a single TLS connection via yamux streams.
+// getSession returns a multiplexed session from the pool, creating one if needed.
+// All SOCKS5 connections share a pool of TLS connections via yamux streams.
 // The TLS handshake uses the REALITY protocol: authentication is embedded into
 // the ClientHello via ECDH + AES-GCM-encrypted SessionID, making the connection
 // indistinguishable from a real TLS handshake to a legitimate site.
 func getSession() (*yamux.Session, error) {
-	sessMu.Lock()
-	defer sessMu.Unlock()
+	idx := mrand.Intn(gSessionsNum)
+	sessMu[idx].Lock()
+	defer sessMu[idx].Unlock()
 
-	if sess != nil && !sess.IsClosed() {
-		return sess, nil
+	if sessions[idx] != nil && !sessions[idx].IsClosed() {
+		return sessions[idx], nil
 	}
 
 	tcpConn, err := net.DialTimeout("tcp", gServerAddr, 10*time.Second)
@@ -134,7 +147,7 @@ func getSession() (*yamux.Session, error) {
 
 	// Build the ClientHello state in memory without sending it yet.
 	if err := uConn.BuildHandshakeState(); err != nil {
-		tcpConn.Close()
+		go tcpConn.Close()
 		return nil, fmt.Errorf("build handshake state: %w", err)
 	}
 
@@ -152,19 +165,19 @@ func getSession() (*yamux.Session, error) {
 		ephPriv = uConn.HandshakeState.State13.EcdheKey
 	}
 	if ephPriv == nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("no x25519 key share in ClientHello")
 	}
 
 	// ECDH: shared = X25519(clientEphemeralPriv, serverStaticPub)
 	serverPub, err := ecdh.X25519().NewPublicKey(gServerPubKey)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("parse server public key: %w", err)
 	}
 	sharedSecret, err := ephPriv.ECDH(serverPub)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("ecdh: %w", err)
 	}
 
@@ -172,7 +185,7 @@ func getSession() (*yamux.Session, error) {
 	random := uConn.HandshakeState.Hello.Random
 	authKey, err := hkdf.Key(sha256.New, sharedSecret, random[:20], "REALITY", 32)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("hkdf: %w", err)
 	}
 
@@ -180,7 +193,7 @@ func getSession() (*yamux.Session, error) {
 	// The server decrypts using the same marshaled form as additional data.
 	uConn.HandshakeState.Hello.SessionId = make([]byte, 32) // zero sessionId
 	if err := uConn.MarshalClientHello(); err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("marshal (zero sessionId): %w", err)
 	}
 	aad := append([]byte(nil), uConn.HandshakeState.Hello.Raw...) // copy
@@ -194,12 +207,12 @@ func getSession() (*yamux.Session, error) {
 	// Output: 16 bytes data + 16 bytes tag = 32 bytes → becomes the new SessionId.
 	block, err := aes.NewCipher(authKey)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("aes cipher: %w", err)
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("aes gcm: %w", err)
 	}
 	encSessionId := aead.Seal(nil, random[20:32], plaintext, aad)
@@ -207,13 +220,13 @@ func getSession() (*yamux.Session, error) {
 	// Set the encrypted sessionId and re-marshal.
 	uConn.HandshakeState.Hello.SessionId = encSessionId
 	if err := uConn.MarshalClientHello(); err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("marshal (encrypted sessionId): %w", err)
 	}
 
 	// Complete TLS handshake — sends the modified ClientHello.
 	if err := uConn.Handshake(); err != nil {
-		tcpConn.Close()
+		go tcpConn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 
@@ -226,24 +239,24 @@ func getSession() (*yamux.Session, error) {
 	muxCfg.ConnectionWriteTimeout = 5 * time.Minute
 	newSess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
-		uConn.Close()
+		go uConn.Close()
 		return nil, fmt.Errorf("yamux client: %w", err)
 	}
 
-	sess = newSess
+	sessions[idx] = newSess
 	go scheduleReconnect(newSess)
 	if gShaper {
 		if ctrlStream, err := newSess.Open(); err == nil {
 			if _, err := ctrlStream.Write([]byte{0x02}); err == nil {
 				go readPhaseUpdates(ctrlStream)
 			} else {
-				ctrlStream.Close()
+				go ctrlStream.Close()
 			}
 		}
 	}
 
 	log.Printf("REALITY session established to %s", gServerAddr)
-	return sess, nil
+	return sessions[idx], nil
 }
 
 // scheduleReconnect waits a random interval (3–15 min) then removes the session
@@ -260,27 +273,35 @@ func scheduleReconnect(s *yamux.Session) {
 	}
 	time.Sleep(delay)
 
-	sessMu.Lock()
-	if sess == s {
-		sess = nil
-		if gCloseOnRotate {
-			log.Printf("Session rotated after %s — closing active connections", delay.Round(time.Second))
-			go s.Close()
-		} else {
-			log.Printf("Session rotated after %s — next request will reconnect", delay.Round(time.Second))
+	for i := 0; i < gSessionsNum; i++ {
+		sessMu[i].Lock()
+		if sessions[i] == s {
+			sessions[i] = nil
+			if gCloseOnRotate {
+				log.Printf("Session rotated after %s — closing active connections", delay.Round(time.Second))
+				go s.Close()
+			} else {
+				log.Printf("Session rotated after %s — next request will reconnect", delay.Round(time.Second))
+			}
+			sessMu[i].Unlock()
+			break
 		}
+		sessMu[i].Unlock()
 	}
-	sessMu.Unlock()
 }
 
 // dropStalledSession kills the active session if a stream exceeds the idle timeout.
 func dropStalledSession(s *yamux.Session) {
-	sessMu.Lock()
-	defer sessMu.Unlock()
-	if sess == s {
-		log.Printf("Session stalled during handshake, dropping to refresh connection")
-		sess = nil
-		s.Close()
+	for i := 0; i < gSessionsNum; i++ {
+		sessMu[i].Lock()
+		if sessions[i] == s {
+			log.Printf("Session stalled during handshake, dropping to refresh connection")
+			sessions[i] = nil
+			go s.Close()
+			sessMu[i].Unlock()
+			break
+		}
+		sessMu[i].Unlock()
 	}
 }
 
@@ -295,7 +316,7 @@ func (ts *timeoutStream) Read(p []byte) (n int, err error) {
 	n, err = ts.Conn.Read(p)
 	if err != nil && gConnectionsTimeOut > 0 {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			ts.Conn.Close()
+			go ts.Conn.Close()
 			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
 		}
 	}
@@ -309,7 +330,7 @@ func (ts *timeoutStream) Write(p []byte) (n int, err error) {
 	n, err = ts.Conn.Write(p)
 	if err != nil && gConnectionsTimeOut > 0 {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			ts.Conn.Close()
+			go ts.Conn.Close()
 			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
 		}
 	}
@@ -329,11 +350,13 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 		stream, err := s.Open()
 		if err != nil {
 			// Session may have died; clear it so getSession creates a fresh one.
-			sessMu.Lock()
-			if sess == s {
-				sess = nil
+			for i := 0; i < gSessionsNum; i++ {
+				sessMu[i].Lock()
+				if sessions[i] == s {
+					sessions[i] = nil
+				}
+				sessMu[i].Unlock()
 			}
-			sessMu.Unlock()
 			continue
 		}
 
@@ -348,7 +371,7 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 			}
 		} else {
 			if len(destHost) > 255 {
-				stream.Close()
+				go stream.Close()
 				return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
 			}
 			addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
@@ -363,7 +386,7 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
 		}
 		if _, err := stream.Write(req); err != nil {
-			stream.Close()
+			go stream.Close()
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				dropStalledSession(s)
 			}
@@ -376,14 +399,14 @@ func openStream(destHost string, destPort uint16) (net.Conn, error) {
 			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
 		}
 		if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
-			stream.Close()
+			go stream.Close()
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				dropStalledSession(s)
 			}
 			return nil, fmt.Errorf("read tunnel response: %w", err)
 		}
 		if respBuf[0] != 0x00 {
-			stream.Close()
+			go stream.Close()
 			return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
 		}
 
@@ -401,18 +424,23 @@ func openUDPStream() (net.Conn, error) {
 		}
 		stream, err := s.Open()
 		if err != nil {
-			sessMu.Lock()
-			if sess == s {
-				sess = nil
+			for i := 0; i < gSessionsNum; i++ {
+				sessMu[i].Lock()
+				if sessions[i] == s {
+					sessions[i] = nil
+				}
+				sessMu[i].Unlock()
 			}
-			sessMu.Unlock()
 			continue
 		}
 		if gConnectionsTimeOut > 0 {
 			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
 		}
 		if _, err := stream.Write([]byte{0x01}); err != nil {
-			stream.Close()
+			go stream.Close()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				dropStalledSession(s)
+			}
 			return nil, fmt.Errorf("write UDP cmd: %w", err)
 		}
 		var ack [1]byte
@@ -420,14 +448,14 @@ func openUDPStream() (net.Conn, error) {
 			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
 		}
 		if _, err := io.ReadFull(stream, ack[:]); err != nil {
-			stream.Close()
+			go stream.Close()
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				dropStalledSession(s)
 			}
 			return nil, fmt.Errorf("read UDP ack: %w", err)
 		}
 		if ack[0] != 0x00 {
-			stream.Close()
+			go stream.Close()
 			return nil, fmt.Errorf("server rejected UDP relay")
 		}
 		return &timeoutStream{Conn: stream}, nil
@@ -447,7 +475,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 		log.Printf("UDP ASSOCIATE stream error: %v", err)
 		return
 	}
-	defer stream.Close()
+	defer func() { go stream.Close() }()
 
 	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -455,7 +483,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 		log.Printf("UDP ASSOCIATE listen error: %v", err)
 		return
 	}
-	defer udpConn.Close()
+	defer func() { go udpConn.Close() }()
 
 	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(udpAddr.Port >> 8), byte(udpAddr.Port)}
@@ -503,17 +531,17 @@ func handleSocks5UDP(tcpConn net.Conn) {
 		pktBuf := make([]byte, 3+65535) // persistent: [RSV(2)+FRAG(1)][payload up to 65535]
 		for {
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
-				udpConn.Close()
+				go udpConn.Close()
 				return
 			}
 			payloadLen := binary.BigEndian.Uint32(lenBuf)
 			if payloadLen > 65535 {
-				udpConn.Close()
+				go udpConn.Close()
 				return
 			}
 			payload := pktBuf[3 : 3+payloadLen] // read directly into pktBuf after the SOCKS5 header
 			if _, err := io.ReadFull(stream, payload); err != nil {
-				udpConn.Close()
+				go udpConn.Close()
 				return
 			}
 			addrMu.Lock()
@@ -543,7 +571,7 @@ func closeWrite(c net.Conn) {
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
 func handleSocks5(conn net.Conn) {
-	defer conn.Close()
+	defer func() { go conn.Close() }()
 
 	cmd, host, port, err := socks5Handshake(conn)
 	if err != nil {
@@ -580,7 +608,7 @@ func handleSocks5(conn net.Conn) {
 		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
 		return
 	}
-	defer stream.Close()
+	defer func() { go stream.Close() }()
 
 	log.Printf("Tunneling %s → %s:%d (vision=%v)", conn.RemoteAddr(), host, port, useVision)
 
