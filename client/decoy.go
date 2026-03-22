@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"log"
 	"math/big"
 	"net"
@@ -108,17 +109,76 @@ var decoyTargets = []string{
 	"https://picsum.photos/id/108/200/300",
 	"https://picsum.photos/id/109/200/300",
 	"https://picsum.photos/id/110/200/300",
-	// === HEAVY DOWNLOADS (10 шт — 100-200MB файлы) ===
-	"https://speed.hetzner.de/100MB.bin",
-	"https://download.thinkbroadband.com/100MB.zip",
-	"https://download.thinkbroadband.com/200MB.zip",
-	"https://testfiledownload.com/wp-content/uploads/2020/06/100MB.zip",
-	"https://testfiledownload.com/wp-content/uploads/2020/06/200MB.zip",
-	"https://speedtest.newark.linode.com/100MB-newark.bin",
-	"https://speedtest.atlanta.linode.com/100MB-atlanta.bin",
-	"https://speedtest.london.linode.com/100MB-london.bin",
-	"https://speedtest.frankfurt.linode.com/100MB-frankfurt.bin",
-	"https://speedtest.singapore.linode.com/100MB-singapore.bin",
+
+	// === POPULAR WEB PAGES ===
+	"https://www.google.com",
+	"https://www.youtube.com",
+	"https://x.com",
+	"https://www.instagram.com",
+	"https://chatgpt.com",
+	"https://grok.com",
+	"https://gemini.google.com",
+	"https://claude.ai",
+	"https://www.facebook.com",
+	"https://www.reddit.com",
+	"https://www.tiktok.com",
+	"https://www.linkedin.com",
+	"https://www.amazon.com",
+	"https://www.wikipedia.org",
+	"https://github.com",
+	"https://stackoverflow.com",
+	"https://www.twitch.tv",
+	"https://www.netflix.com",
+	"https://www.bing.com",
+	"https://news.ycombinator.com",
+	"https://www.apple.com",
+	"https://www.microsoft.com",
+
+	// === HEAVY DOWNLOADS (100-200MB файлы) ===
+	// Hetzner
+	"https://fsn1-speed.hetzner.com/100MB.bin",
+	"https://nbg1-speed.hetzner.com/100MB.bin",
+	"https://hel1-speed.hetzner.com/100MB.bin",
+	"https://ash-speed.hetzner.com/100MB.bin",
+	// ThinkBroadband
+	"https://ipv4.download.thinkbroadband.com/100MB.zip",
+	"https://ipv4.download.thinkbroadband.com/200MB.zip",
+	// Tele2 & OVH
+	"http://speedtest.tele2.net/100MB.zip",
+	"https://proof.ovh.net/files/100Mb.dat",
+	// Linode
+	"http://speedtest.newark.linode.com/100MB-newark.bin",
+	"http://speedtest.atlanta.linode.com/100MB-atlanta.bin",
+	"http://speedtest.london.linode.com/100MB-london.bin",
+	"http://speedtest.frankfurt.linode.com/100MB-frankfurt.bin",
+	"http://speedtest.singapore.linode.com/100MB-singapore.bin",
+	// CacheFly
+	"http://cachefly.cachefly.net/100mb.test",
+	// DigitalOcean
+	"http://speedtest-nyc1.digitalocean.com/100mb.test",
+	"http://speedtest-fra1.digitalocean.com/100mb.test",
+	"http://speedtest-sgp1.digitalocean.com/100mb.test",
+	"http://speedtest-blr1.digitalocean.com/100mb.test",
+	// Vultr
+	"https://nj-us-ping.vultr.com/vultr.com.100MB.bin",
+	"https://fra-de-ping.vultr.com/vultr.com.100MB.bin",
+	"https://tok-jp-ping.vultr.com/vultr.com.100MB.bin",
+	"https://syd-au-ping.vultr.com/vultr.com.100MB.bin",
+	// Leaseweb
+	"http://mirror.nl.leaseweb.net/speedtest/100mb.bin",
+	"http://mirror.wdc1.us.leaseweb.net/speedtest/100mb.bin",
+	"http://mirror.sng.leaseweb.net/speedtest/100mb.bin",
+	// IBM / SoftLayer
+	"http://speedtest.dal05.softlayer.com/downloads/test100.zip",
+	"http://speedtest.fra02.softlayer.com/downloads/test100.zip",
+	"http://speedtest.tok02.softlayer.com/downloads/test100.zip",
+	// Hostwinds
+	"http://speedtest.seattle.hostwinds.com/100mb.zip",
+	"http://speedtest.amsterdam.hostwinds.com/100mb.zip",
+	// Cloudflare (динамическая генерация потока байт)
+	"https://speed.cloudflare.com/__down?bytes=104857600", // 100 MB
+	"https://speed.cloudflare.com/__down?bytes=157286400", // 150 MB
+	"https://speed.cloudflare.com/__down?bytes=209715200", // 200 MB
 }
 
 func runDecoyTraffic(listenAddr string) {
@@ -137,7 +197,8 @@ func runDecoyTraffic(listenAddr string) {
 	}
 
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	client := &http.Client{
 		Transport: transport,
