@@ -100,6 +100,10 @@ func main() {
 	gServerPubKey = pubKey
 	copy(gShortId[:], shortIdBytes)
 
+	if gShaper {
+		go manageShaperStream()
+	}
+
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("Failed to listen on %s: %v", *listenAddr, err)
@@ -245,15 +249,6 @@ func getSession() (*yamux.Session, error) {
 
 	sessions[idx] = newSess
 	go scheduleReconnect(newSess)
-	if gShaper {
-		if ctrlStream, err := newSess.Open(); err == nil {
-			if _, err := ctrlStream.Write([]byte{0x02}); err == nil {
-				go readPhaseUpdates(ctrlStream)
-			} else {
-				go ctrlStream.Close()
-			}
-		}
-	}
 
 	log.Printf("REALITY session established to %s", gServerAddr)
 	return sessions[idx], nil
@@ -627,7 +622,11 @@ func handleSocks5(conn net.Conn) {
 			done <- struct{}{}
 		}()
 		go func() {
-			visionCopyFromTunnel(pc, stream)
+			var src io.Reader = stream
+			if gShaper {
+				src = &shapedReader{r: stream, bucket: &gDownBucket}
+			}
+			visionCopyFromTunnel(pc, src)
 			closeWrite(pc)
 			done <- struct{}{}
 		}()
@@ -645,7 +644,11 @@ func handleSocks5(conn net.Conn) {
 		}()
 		go func() {
 			b := copyBufPool.Get().(*[]byte)
-			io.CopyBuffer(pc, stream, *b)
+			var src io.Reader = stream
+			if gShaper {
+				src = &shapedReader{r: stream, bucket: &gDownBucket}
+			}
+			io.CopyBuffer(pc, src, *b)
 			copyBufPool.Put(b)
 			closeWrite(pc)
 			done <- struct{}{}

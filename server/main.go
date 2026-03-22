@@ -14,7 +14,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -141,7 +140,6 @@ func handleConn(conn net.Conn) {
 	defer muxSess.Close()
 
 	log.Printf("Session from %s", conn.RemoteAddr())
-	var shaper atomic.Pointer[sessionShaper]
 	for {
 		stream, err := muxSess.Accept()
 		if err != nil {
@@ -157,15 +155,13 @@ func handleConn(conn net.Conn) {
 			var streamErr error
 			switch cmdBuf[0] {
 			case 0x00:
-				streamErr = handleTunnel(s, shaper.Load())
+				streamErr = handleTunnel(s)
 			case 0x01:
 				streamErr = handleUDPRelay(s)
 			case 0x03:
-				streamErr = handleVisionTunnel(s, shaper.Load())
+				streamErr = handleVisionTunnel(s)
 			case 0x02:
-				sh := &sessionShaper{}
-				shaper.Store(sh)
-				sh.runPhaseEngine(s)
+				runPhaseEngine(s)
 				return
 			default:
 				log.Printf("unknown stream cmd 0x%02x from %s", cmdBuf[0], conn.RemoteAddr())
@@ -200,7 +196,7 @@ func closeWrite(c net.Conn) {
 //	0x04 — IPv6  (16 bytes)
 //
 // Response: [1 byte: 0x00 = ok, 0x01 = error]
-func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
+func handleTunnel(conn net.Conn) error {
 	// Read address type
 	atyp := make([]byte, 1)
 	if _, err := io.ReadFull(conn, atyp); err != nil {
@@ -268,11 +264,7 @@ func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 	}()
 	go func() {
 		b := copyBufPool.Get().(*[]byte)
-		var dst io.Writer = conn
-		if shaper != nil {
-			dst = shaper.downWriter(conn)
-		}
-		io.CopyBuffer(dst, remote, *b)
+		io.CopyBuffer(conn, remote, *b)
 		copyBufPool.Put(b)
 		closeWrite(conn)
 		done <- struct{}{}
@@ -287,8 +279,7 @@ func handleTunnel(conn net.Conn, shaper *sessionShaper) error {
 // Address parsing is identical to handleTunnel. After dialing the target,
 // upload direction (client→remote) is Vision-decoded (strip padding/sentinel),
 // download direction (remote→client) is Vision-encoded (add padding/sentinel).
-// Shaper ↓ throttle is applied on the download path via shaper.downWriter.
-func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
+func handleVisionTunnel(conn net.Conn) error {
 	atyp := make([]byte, 1)
 	if _, err := io.ReadFull(conn, atyp); err != nil {
 		return fmt.Errorf("vision read atyp: %w", err)
@@ -351,13 +342,9 @@ func handleVisionTunnel(conn net.Conn, shaper *sessionShaper) error {
 		done <- struct{}{}
 	}()
 
-	// Download: remote→client — add Vision framing, optional Shaper ↓ throttle.
+	// Download: remote→client — add Vision framing.
 	go func() {
-		var dst io.Writer = conn
-		if shaper != nil {
-			dst = shaper.downWriter(conn)
-		}
-		visionCopyToTunnel(dst, remote)
+		visionCopyToTunnel(conn, remote)
 		closeWrite(conn)
 		done <- struct{}{}
 	}()

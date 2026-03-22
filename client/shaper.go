@@ -14,6 +14,9 @@ import (
 // nil means no throttling (default/fallback behaviour).
 var gUpBucket atomic.Pointer[rateBucket]
 
+// gDownBucket is the current download rate bucket, atomically replaced on each phase change.
+var gDownBucket atomic.Pointer[rateBucket]
+
 // rateBucket is a token-bucket rate limiter with a cancellable sleep.
 // When paused (bytesPerSec == 0), writes block entirely until the phase changes or expires.
 type rateBucket struct {
@@ -97,6 +100,35 @@ func cancelCurrentPhase() {
 //
 // The client sets a local timer for duration_ms; when it fires, the bucket is cleared
 // and uploads fall back to default (no throttle). A new phase message cancels the previous timer.
+func manageShaperStream() {
+	for {
+		sess, err := getSession()
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		ctrlStream, err := sess.Open()
+		if err != nil {
+			// Session may have died; wait and retry
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if _, err := ctrlStream.Write([]byte{0x02}); err != nil {
+			ctrlStream.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// readPhaseUpdates blocks until the stream is closed
+		readPhaseUpdates(ctrlStream)
+
+		// Wait briefly before reconnecting the control stream
+		time.Sleep(2 * time.Second)
+	}
+}
+
 func readPhaseUpdates(controlStream io.ReadCloser) {
 	defer func() { go controlStream.Close() }()
 	buf := make([]byte, 12)
@@ -104,6 +136,9 @@ func readPhaseUpdates(controlStream io.ReadCloser) {
 		if _, err := io.ReadFull(controlStream, buf); err != nil {
 			cancelCurrentPhase()
 			if old := gUpBucket.Swap(nil); old != nil {
+				close(old.done)
+			}
+			if old := gDownBucket.Swap(nil); old != nil {
 				close(old.done)
 			}
 			return
@@ -114,8 +149,13 @@ func readPhaseUpdates(controlStream io.ReadCloser) {
 
 		cancelCurrentPhase()
 
-		newBucket := newRateBucket(float64(upMbps) * 125_000)
-		if old := gUpBucket.Swap(newBucket); old != nil {
+		newUpBucket := newRateBucket(float64(upMbps) * 125_000)
+		if old := gUpBucket.Swap(newUpBucket); old != nil {
+			close(old.done)
+		}
+
+		newDownBucket := newRateBucket(float64(downMbps) * 125_000)
+		if old := gDownBucket.Swap(newDownBucket); old != nil {
 			close(old.done)
 		}
 
@@ -125,13 +165,21 @@ func readPhaseUpdates(controlStream io.ReadCloser) {
 		phaseCancelMu.Unlock()
 
 		dur := time.Duration(durationMs) * time.Millisecond
-		bucket := newBucket // capture for CAS
+		upBucket := newUpBucket     // capture for CAS
+		downBucket := newDownBucket // capture for CAS
 		go func() {
 			select {
 			case <-time.After(dur):
 				// Phase expired: revert to no-throttle only if our bucket is still active.
-				if gUpBucket.CompareAndSwap(bucket, nil) {
-					close(bucket.done)
+				upExpired := gUpBucket.CompareAndSwap(upBucket, nil)
+				if upExpired {
+					close(upBucket.done)
+				}
+				downExpired := gDownBucket.CompareAndSwap(downBucket, nil)
+				if downExpired {
+					close(downBucket.done)
+				}
+				if upExpired || downExpired {
 					log.Printf("[shaper] phase expired → fallback (no throttle)")
 				}
 			case <-cancelCh:
@@ -164,4 +212,24 @@ func (sw *shapedWriter) Write(p []byte) (int, error) {
 		// bucket was superseded; loop to pick up the new one
 	}
 	return sw.w.Write(p)
+}
+
+// shapedReader wraps an io.Reader and throttles each Read through an
+// atomically-updated rate bucket.
+type shapedReader struct {
+	r      io.Reader
+	bucket *atomic.Pointer[rateBucket]
+}
+
+func (sr *shapedReader) Read(p []byte) (n int, err error) {
+	n, err = sr.r.Read(p)
+	if n > 0 {
+		for {
+			b := sr.bucket.Load()
+			if b == nil || b.wait(int64(n)) {
+				break
+			}
+		}
+	}
+	return n, err
 }
