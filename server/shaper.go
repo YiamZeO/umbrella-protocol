@@ -7,7 +7,10 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"os"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Phase describes a traffic shaping profile: bandwidth limits and duration range.
@@ -19,19 +22,47 @@ type Phase struct {
 	UpMbps      float64 // client→server bandwidth cap (applied on the client side)
 }
 
-// Phases is the set of traffic profiles SmartShaper randomly cycles through.
-// Profiles mirror realistic browser traffic patterns:
-//
-//	idle      — user is reading, no data transfer
-//	page_load — loading HTML/CSS/JS/fonts of a new page
-//	images    — loading image gallery or thumbnails
-//	api_call  — short XHR/fetch request
-//	upload    — user uploading a file or photo
-var Phases = []Phase{
-	{"page_load", 1 * time.Second, 4 * time.Second, 12.0, 0.8},
-	{"images", 1 * time.Second, 4 * time.Second, 6.0, 0.1},
-	{"api_call", 500 * time.Millisecond, 2 * time.Second, 0.4, 0.3},
-	{"upload", 1 * time.Second, 5 * time.Second, 0.3, 4.0},
+var Phases []Phase
+
+// loadPhases reads phases from YAML config file and populates the global Phases slice.
+// YAML uses map format with phase name as key.
+func loadPhases(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	type phaseConfig struct {
+		MinDuration int     `yaml:"min_duration"`
+		MaxDuration int     `yaml:"max_duration"`
+		DownMbps    float64 `yaml:"down_mbps"`
+		UpMbps      float64 `yaml:"up_mbps"`
+	}
+
+	var config map[string]phaseConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return err
+	}
+
+	Phases = make([]Phase, 0, len(config))
+	for name, p := range config {
+		Phases = append(Phases, Phase{
+			Name:        name,
+			MinDuration: time.Duration(p.MinDuration) * time.Second,
+			MaxDuration: time.Duration(p.MaxDuration) * time.Second,
+			DownMbps:    p.DownMbps,
+			UpMbps:      p.UpMbps,
+		})
+	}
+
+	return nil
+}
+
+func init() {
+	if err := loadPhases("phases.yml"); err != nil {
+		log.Fatalf("failed to load phases from phases.yml: %v", err)
+	}
+	log.Printf("Loaded %d phases from phases.yml", len(Phases))
 }
 
 // randPhaseIdx returns a random phase index different from last.
