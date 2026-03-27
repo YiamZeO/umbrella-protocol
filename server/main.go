@@ -160,9 +160,6 @@ func handleConn(conn net.Conn) {
 				streamErr = handleUDPRelay(s)
 			case 0x03:
 				streamErr = handleVisionTunnel(s)
-			case 0x02:
-				runPhaseEngine(s)
-				return
 			default:
 				log.Printf("unknown stream cmd 0x%02x from %s", cmdBuf[0], conn.RemoteAddr())
 				return

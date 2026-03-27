@@ -1,14 +1,108 @@
 package main
 
 import (
-	"encoding/binary"
+	"crypto/rand"
 	"io"
 	"log"
-	"math"
+	"math/big"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+// Phase describes a traffic shaping profile: bandwidth limits and duration range.
+type Phase struct {
+	Name        string
+	MinDuration time.Duration
+	MaxDuration time.Duration
+	DownMbps    float64 // server→client bandwidth cap (applied on the client side)
+	UpMbps      float64 // client→server bandwidth cap (applied on the client side)
+}
+
+var Phases []Phase
+
+// loadPhases reads phases from YAML config file and populates the global Phases slice.
+// YAML uses map format with phase name as key.
+func loadPhases(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	type phaseConfig struct {
+		MinDuration int     `yaml:"min_duration"`
+		MaxDuration int     `yaml:"max_duration"`
+		DownMbps    float64 `yaml:"down_mbps"`
+		UpMbps      float64 `yaml:"up_mbps"`
+	}
+
+	var config map[string]phaseConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return err
+	}
+
+	Phases = make([]Phase, 0, len(config))
+	for name, p := range config {
+		Phases = append(Phases, Phase{
+			Name:        name,
+			MinDuration: time.Duration(p.MinDuration) * time.Second,
+			MaxDuration: time.Duration(p.MaxDuration) * time.Second,
+			DownMbps:    p.DownMbps,
+			UpMbps:      p.UpMbps,
+		})
+	}
+
+	return nil
+}
+
+// randPhaseIdx returns a random phase index different from last (if phases more then 1).
+// last == -1 means no constraint (first selection).
+// Special case for len(Phases)==1 to avoid infinite loop.
+func randPhaseIdx(last int) int {
+	if len(Phases) == 0 {
+		return 0
+	}
+	if len(Phases) == 1 {
+		return 0
+	}
+	for {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(Phases))))
+		if err != nil {
+			// crypto/rand failure — fall back to simple round-robin
+			return (last + 1) % len(Phases)
+		}
+		if idx := int(n.Int64()); idx != last {
+			return idx
+		}
+	}
+}
+
+// randPhaseDuration returns a random duration in [p.MinDuration, p.MaxDuration).
+func randPhaseDuration(p Phase) time.Duration {
+	span := p.MaxDuration - p.MinDuration
+	if span <= 0 {
+		return p.MinDuration
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
+	if err != nil {
+		return p.MinDuration
+	}
+	return p.MinDuration + time.Duration(n.Int64())
+}
+
+// randGapDuration returns a random inter-phase gap in [1, 10) seconds.
+func randGapDuration() time.Duration {
+	const minGap = 1 * time.Second
+	const maxGap = 10 * time.Second
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxGap-minGap)))
+	if err != nil {
+		return minGap
+	}
+	return minGap + time.Duration(n.Int64())
+}
 
 // gUpBucket is the current upload rate bucket, atomically replaced on each phase change.
 // nil means no throttling (default/fallback behaviour).
@@ -35,8 +129,18 @@ func newRateBucket(bytesPerSec float64) *rateBucket {
 		b.paused = true
 	} else {
 		b.rate = bytesPerSec / 1e9
-		b.capacity = bytesPerSec
-		b.tokens = bytesPerSec
+		// Use a 100ms window for burst capacity to allow OS scheduler jitter
+		// while maintaining steady average throughput.
+		const burstWindow = 100 * time.Millisecond
+		b.capacity = bytesPerSec * burstWindow.Seconds()
+
+		// Ensure a minimum burst size (e.g., 64KB) to avoid excessive throttling
+		// on low bandwidth limits where 100ms might be too small for typical MTU.
+		if b.capacity < 64*1024 {
+			b.capacity = 64 * 1024
+		}
+
+		b.tokens = b.capacity
 		b.last = time.Now()
 	}
 	return b
@@ -57,12 +161,9 @@ func (b *rateBucket) wait(n int64) bool {
 	}
 	b.last = now
 	var sleep time.Duration
-	if float64(n) <= b.tokens {
-		b.tokens -= float64(n)
-	} else {
-		deficit := float64(n) - b.tokens
-		b.tokens = 0
-		sleep = time.Duration(deficit / b.rate)
+	b.tokens -= float64(n)
+	if b.tokens < 0 {
+		sleep = time.Duration(-b.tokens / b.rate)
 	}
 	b.mu.Unlock()
 	if sleep > 0 {
@@ -73,6 +174,19 @@ func (b *rateBucket) wait(n int64) bool {
 		}
 	}
 	return true
+}
+
+// refund adds back n tokens. Used when a Read returns fewer bytes than requested.
+func (b *rateBucket) refund(n int64) {
+	if n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.tokens += float64(n)
+	if b.tokens > b.capacity {
+		b.tokens = b.capacity
+	}
+	b.mu.Unlock()
 }
 
 // phaseCancel tracks the stop channel for the currently active phase timer.
@@ -91,107 +205,79 @@ func cancelCurrentPhase() {
 	}
 }
 
-// readPhaseUpdates reads full phase parameters from controlStream sent by the server
-// and updates the upload bucket accordingly. Each message is 12 bytes:
-//
-//	[0:4]  duration_ms  uint32, big-endian
-//	[4:8]  down_mbps    float32 bits, big-endian (server-side only, ignored here)
-//	[8:12] up_mbps      float32 bits, big-endian
-//
-// The client sets a local timer for duration_ms; when it fires, the bucket is cleared
-// and uploads fall back to default (no throttle). A new phase message cancels the previous timer.
-func manageShaperStream() {
-	for {
-		sess, err := getSession()
-		if err != nil {
-			time.Sleep(2 * time.Second)
-			continue
-		}
+// applyPhase updates the global rate buckets with new limits and starts a local
+// expiration timer for the phase. This is used by both the old server-driven and
+// the new local engine.
+func applyPhase(downMbps, upMbps float32, dur time.Duration, name string) {
+	cancelCurrentPhase()
 
-		ctrlStream, err := sess.Open()
-		if err != nil {
-			// Session may have died; wait and retry
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		if _, err := ctrlStream.Write([]byte{0x02}); err != nil {
-			ctrlStream.Close()
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		// readPhaseUpdates blocks until the stream is closed
-		readPhaseUpdates(ctrlStream)
-
-		// Wait briefly before reconnecting the control stream
-		time.Sleep(2 * time.Second)
+	newUpBucket := newRateBucket(float64(upMbps) * 125_000)
+	if old := gUpBucket.Swap(newUpBucket); old != nil {
+		close(old.done)
 	}
+
+	newDownBucket := newRateBucket(float64(downMbps) * 125_000)
+	if old := gDownBucket.Swap(newDownBucket); old != nil {
+		close(old.done)
+	}
+
+	cancelCh := make(chan struct{})
+	phaseCancelMu.Lock()
+	phaseCancel = cancelCh
+	phaseCancelMu.Unlock()
+
+	upBucket := newUpBucket     // capture for CAS
+	downBucket := newDownBucket // capture for CAS
+	go func() {
+		select {
+		case <-time.After(dur):
+			// Phase expired: revert to no-throttle only if our bucket is still active.
+			upExpired := gUpBucket.CompareAndSwap(upBucket, nil)
+			if upExpired {
+				close(upBucket.done)
+			}
+			downExpired := gDownBucket.CompareAndSwap(downBucket, nil)
+			if downExpired {
+				close(downBucket.done)
+			}
+			if upExpired || downExpired {
+				log.Printf("[shaper] phase expired → fallback (no throttle)")
+			}
+		case <-cancelCh:
+			// New phase arrived before this one expired.
+		}
+		phaseCancelMu.Lock()
+		if phaseCancel == cancelCh {
+			phaseCancel = nil
+		}
+		phaseCancelMu.Unlock()
+	}()
+	log.Printf("[shaper] → %s (%.1f↓ %.1f↑ Mbps, %s)", name, downMbps, upMbps, dur.Round(time.Millisecond))
 }
 
-func readPhaseUpdates(controlStream io.ReadCloser) {
-	defer func() { go controlStream.Close() }()
-	buf := make([]byte, 12)
+// runShaperEngine runs the phase selection loop locally on the client.
+// No control stream to server is needed anymore. Phases are chosen randomly
+// (avoiding consecutive repeats), applied for random duration, then a gap.
+func runShaperEngine() {
+	lastIdx := -1
 	for {
-		if _, err := io.ReadFull(controlStream, buf); err != nil {
-			cancelCurrentPhase()
-			if old := gUpBucket.Swap(nil); old != nil {
-				close(old.done)
-			}
-			if old := gDownBucket.Swap(nil); old != nil {
-				close(old.done)
-			}
-			return
+		if len(Phases) == 0 {
+			time.Sleep(10 * time.Second)
+			continue
 		}
-		durationMs := binary.BigEndian.Uint32(buf[0:4])
-		downMbps := math.Float32frombits(binary.BigEndian.Uint32(buf[4:8]))
-		upMbps := math.Float32frombits(binary.BigEndian.Uint32(buf[8:12]))
+		idx := randPhaseIdx(lastIdx)
+		p := Phases[idx]
+		dur := randPhaseDuration(p)
 
-		cancelCurrentPhase()
+		applyPhase(float32(p.DownMbps), float32(p.UpMbps), dur, p.Name)
 
-		newUpBucket := newRateBucket(float64(upMbps) * 125_000)
-		if old := gUpBucket.Swap(newUpBucket); old != nil {
-			close(old.done)
-		}
+		time.Sleep(dur)
 
-		newDownBucket := newRateBucket(float64(downMbps) * 125_000)
-		if old := gDownBucket.Swap(newDownBucket); old != nil {
-			close(old.done)
-		}
-
-		cancelCh := make(chan struct{})
-		phaseCancelMu.Lock()
-		phaseCancel = cancelCh
-		phaseCancelMu.Unlock()
-
-		dur := time.Duration(durationMs) * time.Millisecond
-		upBucket := newUpBucket     // capture for CAS
-		downBucket := newDownBucket // capture for CAS
-		go func() {
-			select {
-			case <-time.After(dur):
-				// Phase expired: revert to no-throttle only if our bucket is still active.
-				upExpired := gUpBucket.CompareAndSwap(upBucket, nil)
-				if upExpired {
-					close(upBucket.done)
-				}
-				downExpired := gDownBucket.CompareAndSwap(downBucket, nil)
-				if downExpired {
-					close(downBucket.done)
-				}
-				if upExpired || downExpired {
-					log.Printf("[shaper] phase expired → fallback (no throttle)")
-				}
-			case <-cancelCh:
-				// New phase arrived before this one expired.
-			}
-			phaseCancelMu.Lock()
-			if phaseCancel == cancelCh {
-				phaseCancel = nil
-			}
-			phaseCancelMu.Unlock()
-		}()
-		log.Printf("[shaper] → (%.1f↓ %.1f↑ Mbps, %s)", downMbps, upMbps, dur.Round(time.Millisecond))
+		// Inter-phase gap: reset to no-throttle, wait before next phase.
+		gap := randGapDuration()
+		log.Printf("[shaper] gap %s before next phase", gap.Round(time.Millisecond))
+		time.Sleep(gap)
+		lastIdx = idx
 	}
 }
 
@@ -203,33 +289,42 @@ type shapedWriter struct {
 	bucket *atomic.Pointer[rateBucket]
 }
 
-func (sw *shapedWriter) Write(p []byte) (int, error) {
+func (sw *shapedWriter) Write(p []byte) (n int, err error) {
+	var b *rateBucket
 	for {
-		b := sw.bucket.Load()
+		b = sw.bucket.Load()
 		if b == nil || b.wait(int64(len(p))) {
 			break
 		}
 		// bucket was superseded; loop to pick up the new one
 	}
-	return sw.w.Write(p)
+	n, err = sw.w.Write(p)
+	if b != nil && n < len(p) {
+		b.refund(int64(len(p) - n))
+	}
+	return n, err
 }
 
 // shapedReader wraps an io.Reader and throttles each Read through an
 // atomically-updated rate bucket.
+// Throttle *before* Read to apply backpressure on the network stream
+// (critical for effective download limiting).
 type shapedReader struct {
 	r      io.Reader
 	bucket *atomic.Pointer[rateBucket]
 }
 
 func (sr *shapedReader) Read(p []byte) (n int, err error) {
-	n, err = sr.r.Read(p)
-	if n > 0 {
-		for {
-			b := sr.bucket.Load()
-			if b == nil || b.wait(int64(n)) {
-				break
-			}
+	var b *rateBucket
+	for {
+		b = sr.bucket.Load()
+		if b == nil || b.wait(int64(len(p))) {
+			break
 		}
+	}
+	n, err = sr.r.Read(p)
+	if b != nil && n < len(p) {
+		b.refund(int64(len(p) - n))
 	}
 	return n, err
 }

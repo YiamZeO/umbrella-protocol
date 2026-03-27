@@ -16,7 +16,6 @@ import (
 	"log"
 	"math/big"
 	mrand "math/rand"
-	
 	"net"
 	"sync"
 	"time"
@@ -53,6 +52,7 @@ func main() {
 	udpEnabled := flag.Bool("udp", true, "enable SOCKS5 UDP ASSOCIATE (false = TCP-only)")
 	closeOnRotate := flag.Bool("close-on-rotate", false, "close active connections when session rotates (default: let them finish naturally)")
 	shaper := flag.Bool("shaper", false, "enable Shaper behavioural traffic shaping")
+	phasesFile := flag.String("phases-file", "phases.yml", "path to YAML file with traffic shaping phases")
 	connTimeout := flag.Int("connections-time-out", 300, "close connection if idle > timeout seconds (0 to disable)")
 	sessionsNum := flag.Int("sessions-num", 5, "number of multiplexed sessions to pool (default 5)")
 	flag.Parse()
@@ -69,10 +69,6 @@ func main() {
 	}
 	sessMu = make([]sync.Mutex, gSessionsNum)
 	sessions = make([]*yamux.Session, gSessionsNum)
-
-	if *shaper && !*closeOnRotate {
-		log.Fatal("--shaper requires --close-on-rotate: without it multiple shapers from overlapping sessions will fight over the global throttle")
-	}
 
 	if *serverAddr == "" {
 		log.Fatal("--server is required")
@@ -100,7 +96,11 @@ func main() {
 	copy(gShortId[:], shortIdBytes)
 
 	if gShaper {
-		go manageShaperStream()
+		if err := loadPhases(*phasesFile); err != nil {
+			log.Fatalf("failed to load phases from %s: %v", *phasesFile, err)
+		}
+		log.Printf("Loaded %d phases from %s", len(Phases), *phasesFile)
+		go runShaperEngine()
 	}
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -486,6 +486,15 @@ func handleSocks5UDP(tcpConn net.Conn) {
 	var addrMu sync.Mutex
 	var appAddr net.Addr
 
+	// Integrate shaper for UDP: throttle upload on writes to relay stream,
+	// download on reads from relay stream. Uses same global buckets as TCP.
+	var relayWriter io.Writer = stream
+	var relayReader io.Reader = stream
+	if gShaper {
+		relayWriter = &shapedWriter{w: stream, bucket: &gUpBucket}
+		relayReader = &shapedReader{r: stream, bucket: &gDownBucket}
+	}
+
 	// App → Server: receive SOCKS5 UDP datagrams, strip RSV(2)+FRAG(1) prefix,
 	// and forward [ATYP+ADDR+PORT+DATA] as length-prefixed frames over the relay stream.
 	go func() {
@@ -508,7 +517,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 			binary.BigEndian.PutUint32(frameBuf[:4], uint32(len(payload)))
 			copy(frameBuf[4:], payload)
 			stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := stream.Write(frameBuf[:4+len(payload)]); err != nil {
+			if _, err := relayWriter.Write(frameBuf[:4+len(payload)]); err != nil {
 				return
 			}
 		}
@@ -520,7 +529,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 		lenBuf := make([]byte, 4)
 		pktBuf := make([]byte, 3+65535) // persistent: [RSV(2)+FRAG(1)][payload up to 65535]
 		for {
-			if _, err := io.ReadFull(stream, lenBuf); err != nil {
+			if _, err := io.ReadFull(relayReader, lenBuf); err != nil {
 				go udpConn.Close()
 				return
 			}
@@ -530,7 +539,7 @@ func handleSocks5UDP(tcpConn net.Conn) {
 				return
 			}
 			payload := pktBuf[3 : 3+payloadLen] // read directly into pktBuf after the SOCKS5 header
-			if _, err := io.ReadFull(stream, payload); err != nil {
+			if _, err := io.ReadFull(relayReader, payload); err != nil {
 				go udpConn.Close()
 				return
 			}

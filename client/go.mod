@@ -5,6 +5,7 @@ go 1.25.6
 require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/refraction-networking/utls v1.8.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
