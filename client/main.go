@@ -450,20 +450,32 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
 func handleSocks5UDP(tcpConn net.Conn) {
-	s, err := getSession()
+	defer func() { go tcpConn.Close() }()
+	var (
+		err    error
+		s      *yamux.Session
+		stream net.Conn
+	)
+	for range gSessionsNum + 1 {
+		s, err = getSession()
+		if err != nil {
+			log.Printf("UDP getSession error: %v", err)
+			continue
+		}
+		// Open relay stream first so we can signal failure before replying to client.
+		stream, err = openUDPStream(s)
+		if err != nil {
+			log.Printf("UDP ASSOCIATE stream error: %v", err)
+		} else {
+			break
+		}
+	}
+
 	if err != nil {
 		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		log.Printf("UDP getSession error: %v", err)
 		return
 	}
 
-	// Open relay stream first so we can signal failure before replying to client.
-	stream, err := openUDPStream(s)
-	if err != nil {
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		log.Printf("UDP ASSOCIATE stream error: %v", err)
-		return
-	}
 	defer func() { go stream.Close() }()
 
 	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -596,20 +608,28 @@ func handleSocks5(conn net.Conn) {
 	// Use Vision framing if it looks like a TLS handshake (0x16).
 	useVision := firstByte == 0x16
 
-	s, err := getSession()
-	if err != nil {
-		log.Printf("getSession error for %s:%d: %v", host, port, err)
-		return
+	var (
+		stream net.Conn
+		s      *yamux.Session
+	)
+	for range gSessionsNum + 1 {
+		s, err = getSession()
+		if err != nil {
+			log.Printf("getSession error for %s:%d: %v", host, port, err)
+			continue
+		}
+		if useVision {
+			stream, err = openVisionStream(s, host, port)
+		} else {
+			stream, err = openStream(s, host, port)
+		}
+		if err != nil {
+			log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
+		} else {
+			break
+		}
 	}
-
-	var stream net.Conn
-	if useVision {
-		stream, err = openVisionStream(s, host, port)
-	} else {
-		stream, err = openStream(s, host, port)
-	}
 	if err != nil {
-		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
 		return
 	}
 	defer func() { go stream.Close() }()
