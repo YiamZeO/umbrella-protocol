@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -188,6 +189,30 @@ func peekOneByte(conn net.Conn) (*peekConn, byte, error) {
 	return pc, b[0], nil
 }
 
+// visionConn оборачивает yamux.Stream и прозрачно выполняет Vision-фрейминг.
+type visionConn struct {
+	net.Conn
+	appReader *io.PipeReader
+	appWriter *io.PipeWriter
+	closeOnce sync.Once
+}
+
+func (v *visionConn) Read(p []byte) (int, error) {
+	return v.appReader.Read(p)
+}
+
+func (v *visionConn) Write(p []byte) (int, error) {
+	return v.appWriter.Write(p)
+}
+
+func (v *visionConn) Close() error {
+	v.closeOnce.Do(func() {
+		v.appWriter.Close()
+		v.appReader.Close()
+	})
+	return v.Conn.Close()
+}
+
 // openVisionStream открывает yamux-поток типа 0x03 (Vision TCP tunnel).
 // Протокол совпадает с openStream, но первый байт команды = 0x03.
 func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
@@ -251,5 +276,24 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 		return nil, fmt.Errorf("server rejected vision connection to %s:%d", destHost, destPort)
 	}
 
-	return &timeoutStream{Conn: stream}, nil
+	appRead, visionWrite := io.Pipe()
+	visionRead, appWrite := io.Pipe()
+
+	vConn := &visionConn{
+		Conn:      &timeoutStream{Conn: stream},
+		appReader: appRead,
+		appWriter: appWrite,
+	}
+
+	go func() {
+		visionCopyToTunnel(stream, visionRead)
+		stream.Close()
+	}()
+
+	go func() {
+		visionCopyFromTunnel(visionWrite, stream)
+		appRead.Close()
+	}()
+
+	return vConn, nil
 }

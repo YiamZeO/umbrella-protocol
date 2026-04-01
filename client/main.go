@@ -618,51 +618,28 @@ func handleSocks5(conn net.Conn) {
 
 	done := make(chan struct{}, 2)
 
-	if useVision {
-		// Vision mode: encode upload (app→stream), decode download (stream→app).
-		// Shaper upload throttle wraps the stream writer before passing to Vision.
-		go func() {
-			var dst io.Writer = stream
-			if gShaper {
-				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
-			}
-			visionCopyToTunnel(dst, pc)
-			closeWrite(stream)
-			done <- struct{}{}
-		}()
-		go func() {
-			var src io.Reader = stream
-			if gShaper {
-				src = &shapedReader{r: stream, bucket: &gDownBucket}
-			}
-			visionCopyFromTunnel(pc, src)
-			closeWrite(pc)
-			done <- struct{}{}
-		}()
-	} else {
-		go func() {
-			b := copyBufPool.Get().(*[]byte)
-			var dst io.Writer = stream
-			if gShaper {
-				dst = &shapedWriter{w: stream, bucket: &gUpBucket}
-			}
-			io.CopyBuffer(dst, pc, *b)
-			copyBufPool.Put(b)
-			closeWrite(stream)
-			done <- struct{}{}
-		}()
-		go func() {
-			b := copyBufPool.Get().(*[]byte)
-			var src io.Reader = stream
-			if gShaper {
-				src = &shapedReader{r: stream, bucket: &gDownBucket}
-			}
-			io.CopyBuffer(pc, src, *b)
-			copyBufPool.Put(b)
-			closeWrite(pc)
-			done <- struct{}{}
-		}()
-	}
+	go func() {
+		b := copyBufPool.Get().(*[]byte)
+		var dst io.Writer = stream
+		if gShaper {
+			dst = &shapedWriter{w: stream, bucket: &gUpBucket}
+		}
+		io.CopyBuffer(dst, pc, *b)
+		copyBufPool.Put(b)
+		closeWrite(stream)
+		done <- struct{}{}
+	}()
+	go func() {
+		b := copyBufPool.Get().(*[]byte)
+		var src io.Reader = stream
+		if gShaper {
+			src = &shapedReader{r: stream, bucket: &gDownBucket}
+		}
+		io.CopyBuffer(pc, src, *b)
+		copyBufPool.Put(b)
+		closeWrite(pc)
+		done <- struct{}{}
+	}()
 
 	<-done
 	<-done

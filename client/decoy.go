@@ -68,6 +68,9 @@ func runDecoyTraffic(sess *yamux.Session) {
 					return nil, err
 				}
 				p, _ := strconv.Atoi(portStr)
+				if p == 443 {
+					return openVisionStream(sess, host, uint16(p))
+				}
 				return openStream(sess, host, uint16(p))
 			},
 			MaxIdleConns:          0,
