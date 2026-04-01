@@ -216,7 +216,16 @@ func (v *visionConn) Close() error {
 // openVisionStream открывает yamux-поток типа 0x03 (Vision TCP tunnel).
 // Протокол совпадает с openStream, но первый байт команды = 0x03.
 func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
-	stream, err := s.Open()
+	var (
+		stream net.Conn
+		err    error
+	)
+	for range 3 {
+		stream, err = s.Open()
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		for i := 0; i < gSessionsNum; i++ {
 			sessMu[i].Lock()
