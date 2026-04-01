@@ -38,6 +38,7 @@ var (
 	gShaper             bool
 	gConnectionsTimeOut time.Duration
 	gSessionsNum        int
+	gDecoyTraffic       bool
 
 	sessMu   []sync.Mutex
 	sessions []*yamux.Session
@@ -55,6 +56,7 @@ func main() {
 	phasesFile := flag.String("phases-file", "phases.yml", "path to YAML file with traffic shaping phases")
 	connTimeout := flag.Int("connections-time-out", 300, "close connection if idle > timeout seconds (0 to disable)")
 	sessionsNum := flag.Int("sessions-num", 5, "number of multiplexed sessions to pool (default 5)")
+	decoyTraffic := flag.Bool("decoy-traffic", false, "enable background decoy traffic to mask activity")
 	flag.Parse()
 
 	mrand.Seed(time.Now().UnixNano())
@@ -64,6 +66,7 @@ func main() {
 	gShaper = *shaper
 	gConnectionsTimeOut = time.Duration(*connTimeout) * time.Second
 	gSessionsNum = *sessionsNum
+	gDecoyTraffic = *decoyTraffic
 	if gSessionsNum < 1 {
 		gSessionsNum = 1
 	}
@@ -245,6 +248,11 @@ func getSession() (*yamux.Session, error) {
 	sessions[idx] = newSess
 	go scheduleReconnect(newSess)
 
+	// Start background decoy traffic in a goroutine if enabled
+	if gDecoyTraffic {
+		go runDecoyTraffic(newSess)
+	}
+
 	log.Printf("REALITY session established to %s", gServerAddr)
 	return sessions[idx], nil
 }
@@ -268,10 +276,10 @@ func scheduleReconnect(s *yamux.Session) {
 		if sessions[i] == s {
 			sessions[i] = nil
 			if gCloseOnRotate {
-				log.Printf("Session rotated after %s — closing active connections", delay.Round(time.Second))
+				log.Printf("Session %p rotated after %s — closing active connections", s, delay.Round(time.Second))
 				go s.Close()
 			} else {
-				log.Printf("Session rotated after %s — next request will reconnect", delay.Round(time.Second))
+				log.Printf("Session %p rotated after %s — next request will reconnect", s, delay.Round(time.Second))
 			}
 			sessMu[i].Unlock()
 			break
@@ -329,128 +337,112 @@ func (ts *timeoutStream) Write(p []byte) (n int, err error) {
 
 // openStream opens a new yamux stream and sends the tunnel destination.
 // Returns a ready-to-use net.Conn for bidirectional data transfer.
-// Retries once if the session has died, transparently reconnecting.
-func openStream(destHost string, destPort uint16) (net.Conn, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		s, err := getSession()
-		if err != nil {
-			return nil, err
-		}
-
-		stream, err := s.Open()
-		if err != nil {
-			// Session may have died; clear it so getSession creates a fresh one.
-			for i := 0; i < gSessionsNum; i++ {
-				sessMu[i].Lock()
-				if sessions[i] == s {
-					sessions[i] = nil
-				}
-				sessMu[i].Unlock()
+func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
+	stream, err := s.Open()
+	if err != nil {
+		// Session may have died; clear it so getSession creates a fresh one.
+		for i := 0; i < gSessionsNum; i++ {
+			sessMu[i].Lock()
+			if sessions[i] == s {
+				sessions[i] = nil
 			}
-			continue
+			sessMu[i].Unlock()
 		}
-
-		// Send destination: [atyp][addr][port]
-		var addrBytes []byte
-		ip := net.ParseIP(destHost)
-		if ip != nil {
-			if ip4 := ip.To4(); ip4 != nil {
-				addrBytes = append([]byte{0x01}, ip4...)
-			} else {
-				addrBytes = append([]byte{0x04}, ip.To16()...)
-			}
-		} else {
-			if len(destHost) > 255 {
-				go stream.Close()
-				return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
-			}
-			addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
-		}
-
-		var portBytes [2]byte
-		binary.BigEndian.PutUint16(portBytes[:], destPort)
-
-		req := append([]byte{0x00}, addrBytes...)
-		req = append(req, portBytes[:]...)
-		if gConnectionsTimeOut > 0 {
-			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := stream.Write(req); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("write tunnel request: %w", err)
-		}
-
-		// Read server response: 0x00 = ok, 0x01 = error
-		var respBuf [1]byte
-		if gConnectionsTimeOut > 0 {
-			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("read tunnel response: %w", err)
-		}
-		if respBuf[0] != 0x00 {
-			go stream.Close()
-			return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
-		}
-
-		return &timeoutStream{Conn: stream}, nil
+		return nil, err
 	}
-	return nil, fmt.Errorf("failed to open stream after retry")
+
+	// Send destination: [atyp][addr][port]
+	var addrBytes []byte
+	ip := net.ParseIP(destHost)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			addrBytes = append([]byte{0x01}, ip4...)
+		} else {
+			addrBytes = append([]byte{0x04}, ip.To16()...)
+		}
+	} else {
+		if len(destHost) > 255 {
+			go stream.Close()
+			return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
+		}
+		addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
+	}
+
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], destPort)
+
+	req := append([]byte{0x00}, addrBytes...)
+	req = append(req, portBytes[:]...)
+	if gConnectionsTimeOut > 0 {
+		stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := stream.Write(req); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("write tunnel request: %w", err)
+	}
+
+	// Read server response: 0x00 = ok, 0x01 = error
+	var respBuf [1]byte
+	if gConnectionsTimeOut > 0 {
+		stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("read tunnel response: %w", err)
+	}
+	if respBuf[0] != 0x00 {
+		go stream.Close()
+		return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
+	}
+
+	return &timeoutStream{Conn: stream}, nil
 }
 
 // openUDPStream opens a yamux stream for UDP relay and returns it after server ACK.
-func openUDPStream() (net.Conn, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		s, err := getSession()
-		if err != nil {
-			return nil, err
-		}
-		stream, err := s.Open()
-		if err != nil {
-			for i := 0; i < gSessionsNum; i++ {
-				sessMu[i].Lock()
-				if sessions[i] == s {
-					sessions[i] = nil
-				}
-				sessMu[i].Unlock()
+func openUDPStream(s *yamux.Session) (net.Conn, error) {
+	stream, err := s.Open()
+	if err != nil {
+		for i := 0; i < gSessionsNum; i++ {
+			sessMu[i].Lock()
+			if sessions[i] == s {
+				sessions[i] = nil
 			}
-			continue
+			sessMu[i].Unlock()
 		}
-		if gConnectionsTimeOut > 0 {
-			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := stream.Write([]byte{0x01}); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("write UDP cmd: %w", err)
-		}
-		var ack [1]byte
-		if gConnectionsTimeOut > 0 {
-			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := io.ReadFull(stream, ack[:]); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("read UDP ack: %w", err)
-		}
-		if ack[0] != 0x00 {
-			go stream.Close()
-			return nil, fmt.Errorf("server rejected UDP relay")
-		}
-		return &timeoutStream{Conn: stream}, nil
+		return nil, err
 	}
-	return nil, fmt.Errorf("failed to open UDP stream after retry")
+	if gConnectionsTimeOut > 0 {
+		stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := stream.Write([]byte{0x01}); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("write UDP cmd: %w", err)
+	}
+	var ack [1]byte
+	if gConnectionsTimeOut > 0 {
+		stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := io.ReadFull(stream, ack[:]); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("read UDP ack: %w", err)
+	}
+	if ack[0] != 0x00 {
+		go stream.Close()
+		return nil, fmt.Errorf("server rejected UDP relay")
+	}
+	return &timeoutStream{Conn: stream}, nil
 }
 
 // handleSocks5UDP handles a SOCKS5 UDP ASSOCIATE request.
@@ -458,8 +450,15 @@ func openUDPStream() (net.Conn, error) {
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
 func handleSocks5UDP(tcpConn net.Conn) {
+	s, err := getSession()
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		log.Printf("UDP getSession error: %v", err)
+		return
+	}
+
 	// Open relay stream first so we can signal failure before replying to client.
-	stream, err := openUDPStream()
+	stream, err := openUDPStream(s)
 	if err != nil {
 		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		log.Printf("UDP ASSOCIATE stream error: %v", err)
@@ -597,11 +596,17 @@ func handleSocks5(conn net.Conn) {
 	// Use Vision framing if it looks like a TLS handshake (0x16).
 	useVision := firstByte == 0x16
 
+	s, err := getSession()
+	if err != nil {
+		log.Printf("getSession error for %s:%d: %v", host, port, err)
+		return
+	}
+
 	var stream net.Conn
 	if useVision {
-		stream, err = openVisionStream(host, port)
+		stream, err = openVisionStream(s, host, port)
 	} else {
-		stream, err = openStream(host, port)
+		stream, err = openStream(s, host, port)
 	}
 	if err != nil {
 		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)

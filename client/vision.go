@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/hashicorp/yamux"
 )
 
 // Vision — слой фрейминга поверх yamux-потока, скрывающий сигнатуру TLS-in-TLS.
@@ -188,74 +190,66 @@ func peekOneByte(conn net.Conn) (*peekConn, byte, error) {
 
 // openVisionStream открывает yamux-поток типа 0x03 (Vision TCP tunnel).
 // Протокол совпадает с openStream, но первый байт команды = 0x03.
-func openVisionStream(destHost string, destPort uint16) (net.Conn, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		s, err := getSession()
-		if err != nil {
-			return nil, err
-		}
-
-		stream, err := s.Open()
-		if err != nil {
-			for i := 0; i < gSessionsNum; i++ {
-				sessMu[i].Lock()
-				if sessions[i] == s {
-					sessions[i] = nil
-				}
-				sessMu[i].Unlock()
+func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
+	stream, err := s.Open()
+	if err != nil {
+		for i := 0; i < gSessionsNum; i++ {
+			sessMu[i].Lock()
+			if sessions[i] == s {
+				sessions[i] = nil
 			}
-			continue
+			sessMu[i].Unlock()
 		}
-
-		var addrBytes []byte
-		ip := net.ParseIP(destHost)
-		if ip != nil {
-			if ip4 := ip.To4(); ip4 != nil {
-				addrBytes = append([]byte{0x01}, ip4...)
-			} else {
-				addrBytes = append([]byte{0x04}, ip.To16()...)
-			}
-		} else {
-			if len(destHost) > 255 {
-				go stream.Close()
-				return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
-			}
-			addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
-		}
-
-		var portBytes [2]byte
-		binary.BigEndian.PutUint16(portBytes[:], destPort)
-
-		req := append([]byte{0x03}, addrBytes...) // cmd = 0x03 (Vision)
-		req = append(req, portBytes[:]...)
-		if gConnectionsTimeOut > 0 {
-			stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := stream.Write(req); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("write vision request: %w", err)
-		}
-
-		var respBuf [1]byte
-		if gConnectionsTimeOut > 0 {
-			stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-		}
-		if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
-			go stream.Close()
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				dropStalledSession(s)
-			}
-			return nil, fmt.Errorf("read vision response: %w", err)
-		}
-		if respBuf[0] != 0x00 {
-			go stream.Close()
-			return nil, fmt.Errorf("server rejected vision connection to %s:%d", destHost, destPort)
-		}
-
-		return &timeoutStream{Conn: stream}, nil
+		return nil, err
 	}
-	return nil, fmt.Errorf("failed to open vision stream after retry")
+
+	var addrBytes []byte
+	ip := net.ParseIP(destHost)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			addrBytes = append([]byte{0x01}, ip4...)
+		} else {
+			addrBytes = append([]byte{0x04}, ip.To16()...)
+		}
+	} else {
+		if len(destHost) > 255 {
+			go stream.Close()
+			return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
+		}
+		addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
+	}
+
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], destPort)
+
+	req := append([]byte{0x03}, addrBytes...) // cmd = 0x03 (Vision)
+	req = append(req, portBytes[:]...)
+	if gConnectionsTimeOut > 0 {
+		stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := stream.Write(req); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("write vision request: %w", err)
+	}
+
+	var respBuf [1]byte
+	if gConnectionsTimeOut > 0 {
+		stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
+		go stream.Close()
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
+		return nil, fmt.Errorf("read vision response: %w", err)
+	}
+	if respBuf[0] != 0x00 {
+		go stream.Close()
+		return nil, fmt.Errorf("server rejected vision connection to %s:%d", destHost, destPort)
+	}
+
+	return &timeoutStream{Conn: stream}, nil
 }
