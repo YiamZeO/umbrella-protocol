@@ -307,6 +307,14 @@ type timeoutStream struct {
 	net.Conn
 }
 
+func (ts *timeoutStream) CloseWrite() error {
+	type halfCloser interface{ CloseWrite() error }
+	if hc, ok := ts.Conn.(halfCloser); ok {
+		return hc.CloseWrite()
+	}
+	return nil
+}
+
 func (ts *timeoutStream) Read(p []byte) (n int, err error) {
 	if gConnectionsTimeOut > 0 {
 		ts.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
@@ -338,16 +346,7 @@ func (ts *timeoutStream) Write(p []byte) (n int, err error) {
 // openStream opens a new yamux stream and sends the tunnel destination.
 // Returns a ready-to-use net.Conn for bidirectional data transfer.
 func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
-	var (
-		stream net.Conn
-		err    error
-	)
-	for range 3 {
-		stream, err = s.Open()
-		if err == nil {
-			break
-		}
-	}
+	stream, err := s.Open()
 	if err != nil {
 		// Session may have died; clear it so getSession creates a fresh one.
 		for i := 0; i < gSessionsNum; i++ {
@@ -415,16 +414,7 @@ func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, e
 
 // openUDPStream opens a yamux stream for UDP relay and returns it after server ACK.
 func openUDPStream(s *yamux.Session) (net.Conn, error) {
-	var (
-		stream net.Conn
-		err    error
-	)
-	for range 3 {
-		stream, err = s.Open()
-		if err == nil {
-			break
-		}
-	}
+	stream, err := s.Open()
 	if err != nil {
 		for i := 0; i < gSessionsNum; i++ {
 			sessMu[i].Lock()
@@ -474,16 +464,24 @@ func handleSocks5UDP(tcpConn net.Conn) {
 		s      *yamux.Session
 		stream net.Conn
 	)
-	s, err = getSession()
-	if err != nil {
-		log.Printf("UDP getSession error: %v", err)
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+	for range 3 {
+		s, err = getSession()
+		if err != nil {
+			log.Printf("UDP getSession error: %v", err)
+			tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		// Open relay stream first so we can signal failure before replying to client.
+		stream, err = openUDPStream(s)
+		if err != nil {
+			log.Printf("UDP ASSOCIATE stream error: %v", err)
+			continue
+		} else {
+			break
+		}
 	}
-	// Open relay stream first so we can signal failure before replying to client.
-	stream, err = openUDPStream(s)
+
 	if err != nil {
-		log.Printf("UDP ASSOCIATE stream error: %v", err)
 		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -624,20 +622,28 @@ func handleSocks5(conn net.Conn) {
 		stream net.Conn
 		s      *yamux.Session
 	)
-	s, err = getSession()
+	for range 3 {
+		s, err = getSession()
+		if err != nil {
+			log.Printf("getSession error for %s:%d: %v", host, port, err)
+			return
+		}
+		if useVision {
+			stream, err = openVisionStream(s, host, port)
+		} else {
+			stream, err = openStream(s, host, port)
+		}
+		if err != nil {
+			log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
+		} else {
+			break
+		}
+	}
+
 	if err != nil {
-		log.Printf("getSession error for %s:%d: %v", host, port, err)
 		return
 	}
-	if useVision {
-		stream, err = openVisionStream(s, host, port)
-	} else {
-		stream, err = openStream(s, host, port)
-	}
-	if err != nil {
-		log.Printf("Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
-		return
-	}
+
 	defer func() { go stream.Close() }()
 
 	log.Printf("Tunneling %s → %s:%d (vision=%v)", conn.RemoteAddr(), host, port, useVision)

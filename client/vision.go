@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -40,20 +41,21 @@ const (
 // После первого AppData отправляет sentinel и переходит в splice (io.Copy).
 // SmartShaper: передайте dst уже обёрнутым в shapedWriter, если нужен throttle.
 func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
+	br := bufio.NewReaderSize(src, 32*1024)
 	hdr := make([]byte, 5)
 	sentinel := [2]byte{0xFF, 0xFF}
 	framePfx := make([]byte, 2)
 
 	for {
 		// Читаем TLS record header (type 1 + ver 2 + len 2 = 5 байт).
-		if _, err := io.ReadFull(src, hdr); err != nil {
+		if _, err := io.ReadFull(br, hdr); err != nil {
 			return err
 		}
 		recordType := hdr[0]
 		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
 		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(src, body); err != nil {
+		if _, err := io.ReadFull(br, body); err != nil {
 			return err
 		}
 
@@ -68,7 +70,7 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 			if _, err := dst.Write(body); err != nil {
 				return err
 			}
-			_, err := io.Copy(dst, src)
+			_, err := io.Copy(dst, br)
 			return err
 		}
 
@@ -103,36 +105,37 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 // снимает padding в фазе Handshake, после sentinel переключается на splice.
 // Пишет raw inner TLS в dst (app-соединение).
 func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
+	br := bufio.NewReaderSize(src, 32*1024)
 	pfxBuf := make([]byte, 2)
 	hdr := make([]byte, 5)
 
 	for {
-		if _, err := io.ReadFull(src, pfxBuf); err != nil {
+		if _, err := io.ReadFull(br, pfxBuf); err != nil {
 			return err
 		}
 		padLen := binary.BigEndian.Uint16(pfxBuf)
 
 		if padLen == visionSentinel {
 			// Splice: остальное идёт raw.
-			_, err := io.Copy(dst, src)
+			_, err := io.Copy(dst, br)
 			return err
 		}
 
 		// Отбрасываем padding.
 		if padLen > 0 {
 			discard := make([]byte, padLen)
-			if _, err := io.ReadFull(src, discard); err != nil {
+			if _, err := io.ReadFull(br, discard); err != nil {
 				return err
 			}
 		}
 
 		// Читаем TLS record header и body.
-		if _, err := io.ReadFull(src, hdr); err != nil {
+		if _, err := io.ReadFull(br, hdr); err != nil {
 			return err
 		}
 		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(src, body); err != nil {
+		if _, err := io.ReadFull(br, body); err != nil {
 			return err
 		}
 
@@ -198,11 +201,21 @@ type visionConn struct {
 }
 
 func (v *visionConn) Read(p []byte) (int, error) {
+	if gConnectionsTimeOut > 0 {
+		v.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
 	return v.appReader.Read(p)
 }
 
 func (v *visionConn) Write(p []byte) (int, error) {
+	if gConnectionsTimeOut > 0 {
+		v.Conn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
 	return v.appWriter.Write(p)
+}
+
+func (v *visionConn) CloseWrite() error {
+	return v.appWriter.Close()
 }
 
 func (v *visionConn) Close() error {
@@ -216,16 +229,7 @@ func (v *visionConn) Close() error {
 // openVisionStream открывает yamux-поток типа 0x03 (Vision TCP tunnel).
 // Протокол совпадает с openStream, но первый байт команды = 0x03.
 func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
-	var (
-		stream net.Conn
-		err    error
-	)
-	for range 3 {
-		stream, err = s.Open()
-		if err == nil {
-			break
-		}
-	}
+	stream, err := s.Open()
 	if err != nil {
 		for i := 0; i < gSessionsNum; i++ {
 			sessMu[i].Lock()
@@ -296,12 +300,16 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 
 	go func() {
 		visionCopyToTunnel(stream, visionRead)
-		stream.Close()
+		if hc, ok := stream.(interface{ CloseWrite() error }); ok {
+			hc.CloseWrite()
+		} else {
+			stream.Close()
+		}
 	}()
 
 	go func() {
 		visionCopyFromTunnel(visionWrite, stream)
-		appRead.Close()
+		visionWrite.Close()
 	}()
 
 	return vConn, nil
