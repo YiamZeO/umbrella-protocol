@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -95,7 +94,9 @@ func runDecoyTraffic(sess *yamux.Session) {
 
 			// Выполняем запрос в отдельной горутине, чтобы не блокировать цикл
 			go func(u string) {
-				req, err := http.NewRequest("GET", u, nil)
+				// Используем HEAD вместо GET, чтобы генерировать качественный шум (TLS handshake + headers)
+				// но не выкачивать тело страницы. Это экономит трафик, сохраняя маскировку.
+				req, err := http.NewRequest("HEAD", u, nil)
 				if err != nil {
 					return
 				}
@@ -109,10 +110,8 @@ func runDecoyTraffic(sess *yamux.Session) {
 					log.Printf("Decoy: failed req: %v", err)
 					return
 				}
-				defer resp.Body.Close()
-
-				// Вычитываем тело, чтобы реально загрузить данные, но ограничиваем размер
-				_, _ = io.CopyN(io.Discard, resp.Body, 512*1024) // максимум 512 КБ
+				// Важно закрыть тело, даже если оно пустое, чтобы освободить стрим
+				resp.Body.Close()
 			}(url)
 		}
 
