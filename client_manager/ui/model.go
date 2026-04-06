@@ -9,6 +9,7 @@ import (
 
 	"client_manager/config"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -23,10 +24,14 @@ type state int
 const (
 	stateMainMenu state = iota
 	stateConfigMenu
+	stateTunnelingMenu
 	stateThemeMenu
 	stateAskPath
 	stateCreateConfigName
 	stateCreateConfigFlags
+	stateCreateTunnelName
+	stateCreateTunnelPath
+	stateCreateTunnelFlags
 	stateRunning
 )
 
@@ -48,8 +53,9 @@ type MainModel struct {
 	viewport viewport.Model
 	err      error
 
-	// For creating new config
-	newConfigName string
+	// For creating new config/tunnel
+	newItemName string
+	newItemPath string
 
 	// For running client
 	clientCmd       *exec.Cmd
@@ -58,6 +64,10 @@ type MainModel struct {
 	logChan         chan string
 	terminalWidth   int
 	terminalHeight  int
+
+	// For Tunneling Tool
+	tunnelCmd     *exec.Cmd
+	tunnelRunning bool
 }
 
 func InitialModel(settings *config.Settings) MainModel {
@@ -110,10 +120,47 @@ func (m *MainModel) setupConfigMenu() {
 
 	d := NewListDelegate()
 	m.list = list.New(items, d, 0, 0)
-	m.list.Title = "Настройка конфигураций"
+	m.list.Title = "Конфигурации"
 	m.list.SetShowHelp(false)
 	m.list.Styles.Title = TitleStyle
 	m.list.SetSize(m.terminalWidth-4, m.terminalHeight-15)
+}
+
+func (m *MainModel) setupTunnelingMenu() {
+	m.state = stateTunnelingMenu
+	var items []list.Item
+	for i, t := range m.Settings.TunnelingTools {
+		prefix := ""
+		if i == m.Settings.SelectedTunnelingTool {
+			prefix = "[АКТИВНО] "
+		}
+		items = append(items, listItem{
+			id:    fmt.Sprintf("tunnel_%d", i),
+			title: prefix + t.Name,
+			desc:  t.Path,
+		})
+	}
+
+	d := NewListDelegate()
+	m.list = list.New(items, d, 0, 0)
+	m.list.Title = "Средства туннелирования"
+	m.list.SetShowHelp(false)
+	m.list.Styles.Title = TitleStyle
+	m.list.SetSize(m.terminalWidth-4, m.terminalHeight-15)
+}
+
+func (m *MainModel) deleteHoveredTunnel() {
+	idx := m.list.Index()
+	if idx >= 0 && idx < len(m.Settings.TunnelingTools) {
+		m.Settings.TunnelingTools = append(m.Settings.TunnelingTools[:idx], m.Settings.TunnelingTools[idx+1:]...)
+		if m.Settings.SelectedTunnelingTool == idx {
+			m.Settings.SelectedTunnelingTool = -1
+		} else if m.Settings.SelectedTunnelingTool > idx {
+			m.Settings.SelectedTunnelingTool--
+		}
+		config.SaveSettings(m.Settings)
+		m.setupTunnelingMenu()
+	}
 }
 
 func (m *MainModel) setupThemeMenu() {
@@ -226,14 +273,14 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case stateCreateConfigName:
 			if msg.String() == "enter" {
-				m.newConfigName = m.input.Value()
+				m.newItemName = m.input.Value()
 				m.state = stateCreateConfigFlags
 				m.input.SetValue("")
 				m.input.Placeholder = "Введите флаги запуска..."
 				return m, nil
 			}
 			if msg.String() == "esc" {
-				m.setupMainMenu()
+				m.setupConfigMenu()
 				return m, nil
 			}
 			m.input, cmd = m.input.Update(msg)
@@ -242,17 +289,79 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateCreateConfigFlags:
 			if msg.String() == "enter" {
 				flags := m.input.Value()
-				m.Settings.Configs = append(m.Settings.Configs, config.ClientConfig{Name: m.newConfigName, Flags: flags})
+				m.Settings.Configs = append(m.Settings.Configs, config.ClientConfig{Name: m.newItemName, Flags: flags})
 				if len(m.Settings.Configs) == 1 {
 					m.Settings.SelectedConfig = 0
 				}
 				config.SaveSettings(m.Settings)
-				m.setupMainMenu()
+				m.setupConfigMenu()
 				return m, nil
 			}
 			if msg.String() == "esc" {
 				m.state = stateCreateConfigName
-				m.input.SetValue(m.newConfigName)
+				m.input.SetValue(m.newItemName)
+				return m, nil
+			}
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+
+		case stateCreateTunnelName:
+			if msg.String() == "enter" {
+				m.newItemName = m.input.Value()
+				m.state = stateCreateTunnelPath
+				m.input.SetValue("")
+				m.input.Placeholder = "Введите путь к средству туннелирования..."
+				return m, nil
+			}
+			if msg.String() == "esc" {
+				m.setupTunnelingMenu()
+				return m, nil
+			}
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+
+		case stateCreateTunnelPath:
+			if msg.String() == "enter" {
+				path := strings.Trim(m.input.Value(), "\"")
+				path = filepath.Clean(path)
+				if config.CheckFileExists(path) {
+					m.newItemPath = path
+					m.state = stateCreateTunnelFlags
+					m.input.SetValue("")
+					m.input.Placeholder = "Введите флаги запуска (необязательно)..."
+					return m, nil
+				} else {
+					m.err = fmt.Errorf("файл не найден: %s", path)
+					m.input.SetValue("")
+					return m, nil
+				}
+			}
+			if msg.String() == "esc" {
+				m.state = stateCreateTunnelName
+				m.input.SetValue(m.newItemName)
+				return m, nil
+			}
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+
+		case stateCreateTunnelFlags:
+			if msg.String() == "enter" {
+				flags := m.input.Value()
+				m.Settings.TunnelingTools = append(m.Settings.TunnelingTools, config.TunnelingTool{
+					Name:  m.newItemName,
+					Path:  m.newItemPath,
+					Flags: flags,
+				})
+				if len(m.Settings.TunnelingTools) == 1 {
+					m.Settings.SelectedTunnelingTool = 0
+				}
+				config.SaveSettings(m.Settings)
+				m.setupTunnelingMenu()
+				return m, nil
+			}
+			if msg.String() == "esc" {
+				m.state = stateCreateTunnelPath
+				m.input.SetValue(m.newItemPath)
 				return m, nil
 			}
 			m.input, cmd = m.input.Update(msg)
@@ -272,8 +381,12 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(m.runClientCmd(), waitForLog(m.logChan))
 				}
 				m.err = fmt.Errorf("сначала выберите конфигурацию в настройках")
-			case "s":
+			case "e":
+				return m, m.toggleTunnel()
+			case "k":
 				m.setupConfigMenu()
+			case "s":
+				m.setupTunnelingMenu()
 			case "t":
 				m.setupThemeMenu()
 			}
@@ -288,6 +401,12 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Placeholder = "Введите имя конфигурации..."
 			case "d":
 				m.deleteHoveredConfig()
+			case "o":
+				idx := m.list.Index()
+				if idx >= 0 && idx < len(m.Settings.Configs) {
+					cfg := m.Settings.Configs[idx]
+					return m, m.copyToClipboard(cfg.Flags)
+				}
 			case "t":
 				m.setupThemeMenu()
 			case "enter":
@@ -296,6 +415,28 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.Settings.SelectedConfig = idx
 					config.SaveSettings(m.Settings)
 					m.setupConfigMenu()
+				}
+			default:
+				m.list, cmd = m.list.Update(msg)
+				return m, cmd
+			}
+
+		case stateTunnelingMenu:
+			switch msg.String() {
+			case "b", "esc":
+				m.setupMainMenu()
+			case "c":
+				m.state = stateCreateTunnelName
+				m.input.SetValue("")
+				m.input.Placeholder = "Введите имя средства туннелирования..."
+			case "d":
+				m.deleteHoveredTunnel()
+			case "enter":
+				idx := m.list.Index()
+				if idx >= 0 && idx < len(m.Settings.TunnelingTools) {
+					m.Settings.SelectedTunnelingTool = idx
+					config.SaveSettings(m.Settings)
+					m.setupTunnelingMenu()
 				}
 			default:
 				m.list, cmd = m.list.Update(msg)
@@ -321,24 +462,26 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case stateRunning:
-			if msg.String() == "enter" {
+			switch msg.String() {
+			case "enter":
 				if m.clientCmd != nil && m.clientCmd.Process != nil {
 					m.manuallyStopped = true
-					m.clientCmd.Process.Kill()
+					softKill(m.clientCmd.Process.Pid)
 				}
 				return m, nil
+			case "e":
+				return m, m.toggleTunnel()
 			}
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		}
 
 	case clientFinishedMsg:
-		m.setupMainMenu()
-		if msg.err != nil && !m.manuallyStopped {
-			m.err = msg.err
-		}
-		m.manuallyStopped = false
-		return m, tea.ClearScreen
+		return m, m.handleClientFinished(msg.err)
+
+	case tunnelFinishedMsg:
+		m.handleTunnelFinished(msg.err)
+		return m, nil
 	}
 
 	return m, tea.Batch(cmds...)
@@ -348,15 +491,26 @@ func (m MainModel) View() string {
 	var s string
 
 	// Common header for main states
-	if m.state == stateMainMenu || m.state == stateConfigMenu || m.state == stateThemeMenu || m.state == stateRunning {
+	if m.state == stateMainMenu || m.state == stateConfigMenu || m.state == stateTunnelingMenu || m.state == stateThemeMenu || m.state == stateRunning {
 		s = TitleStyle.Render("Umbrella Client Manager") + "\n"
 
 		// Info Box
 		infoContent := fmt.Sprintf("%s %s\n", ActiveConfigLabelStyle.Render("Клиент:"), m.Settings.ClientPath)
+		
+		tunnelName := "не выбрано"
+		tunnelStatus := "выключено"
+		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
+			t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
+			tunnelName = t.Name
+			if m.tunnelRunning {
+				tunnelStatus = "включено"
+			}
+		}
+		infoContent += fmt.Sprintf("%s %s: %s\n", ActiveConfigLabelStyle.Render("Туннель:"), tunnelName, tunnelStatus)
+
 		if m.Settings.SelectedConfig >= 0 && m.Settings.SelectedConfig < len(m.Settings.Configs) {
 			cfg := m.Settings.Configs[m.Settings.SelectedConfig]
 			infoContent += fmt.Sprintf("%s %s\n", ActiveConfigLabelStyle.Render("Конфиг:"), cfg.Name)
-			infoContent += fmt.Sprintf("%s %s\n", ActiveConfigLabelStyle.Render("Флаги: "), cfg.Flags)
 		} else {
 			infoContent += ErrorStyle.Render("Конфигурация не выбрана") + "\n"
 		}
@@ -367,7 +521,7 @@ func (m MainModel) View() string {
 	}
 
 	switch m.state {
-	case stateAskPath, stateCreateConfigName, stateCreateConfigFlags:
+	case stateAskPath, stateCreateConfigName, stateCreateConfigFlags, stateCreateTunnelName, stateCreateTunnelPath, stateCreateTunnelFlags:
 		s = TitleStyle.Render("Umbrella Client Manager") + "\n\n"
 		s += m.input.View() + "\n\n"
 		if m.err != nil {
@@ -377,9 +531,18 @@ func (m MainModel) View() string {
 
 	case stateMainMenu:
 		s += "\n" + StatusStyle.Render("Используйте горячие клавиши для действий")
-		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s",
+		
+		tunnelAction := "включение\\выключение"
+		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
+			t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
+			tunnelAction = fmt.Sprintf("включение\\выключение %s", t.Name)
+		}
+
+		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
 			KeyStyle.Render("r"), DescStyle.Render("запуск"),
-			KeyStyle.Render("s"), DescStyle.Render("настройки"),
+			KeyStyle.Render("e"), DescStyle.Render(tunnelAction),
+			KeyStyle.Render("k"), DescStyle.Render("конфигурации"),
+			KeyStyle.Render("s"), DescStyle.Render("средство туннелирования"),
 			KeyStyle.Render("t"), DescStyle.Render("тема"),
 			KeyStyle.Render("q"), DescStyle.Render("выход"),
 		)
@@ -392,11 +555,23 @@ func (m MainModel) View() string {
 		s += m.list.View()
 
 		// Help Panel for Settings
-		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s",
+		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
 			KeyStyle.Render("enter"), DescStyle.Render("выбрать"),
 			KeyStyle.Render("c"), DescStyle.Render("создать"),
 			KeyStyle.Render("d"), DescStyle.Render("удалить"),
+			KeyStyle.Render("o"), DescStyle.Render("скопировать флаги"),
 			KeyStyle.Render("t"), DescStyle.Render("тема"),
+			KeyStyle.Render("b"), DescStyle.Render("назад"),
+		)
+
+	case stateTunnelingMenu:
+		s += m.list.View()
+
+		// Help Panel for Tunneling
+		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s",
+			KeyStyle.Render("enter"), DescStyle.Render("выбрать"),
+			KeyStyle.Render("c"), DescStyle.Render("создать"),
+			KeyStyle.Render("d"), DescStyle.Render("удалить"),
 			KeyStyle.Render("b"), DescStyle.Render("назад"),
 		)
 
@@ -411,8 +586,16 @@ func (m MainModel) View() string {
 
 	case stateRunning:
 		s += "\n" + m.viewport.View()
-		s += "\n\n" + fmt.Sprintf("%s %s  %s %s",
+		
+		tunnelAction := "включение\\выключение туннеля"
+		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
+			t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
+			tunnelAction = fmt.Sprintf("включение\\выключение %s", t.Name)
+		}
+
+		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s",
 			KeyStyle.Render("стрелки/PgUp/PgDn"), DescStyle.Render("прокрутка логов"),
+			KeyStyle.Render("e"), DescStyle.Render(tunnelAction),
 			KeyStyle.Render("enter"), DescStyle.Render("остановить клиент"),
 		)
 	}
@@ -432,6 +615,7 @@ func (m *MainModel) runClientCmd() tea.Cmd {
 	fullPath, _ := filepath.Abs(m.Settings.ClientPath)
 
 	m.clientCmd = exec.Command(fullPath, args...)
+	setProcessGroup(m.clientCmd)
 	
 	stdout, _ := m.clientCmd.StdoutPipe()
 	stderr, _ := m.clientCmd.StderrPipe()
@@ -459,4 +643,80 @@ func (m *MainModel) runClientCmd() tea.Cmd {
 		err := m.clientCmd.Wait()
 		return clientFinishedMsg{err: err}
 	}
+}
+
+// --- Tunneling Execution ---
+
+type tunnelFinishedMsg struct{ err error }
+
+func (m *MainModel) toggleTunnel() tea.Cmd {
+	if m.tunnelRunning {
+		m.stopTunnel()
+		return nil
+	}
+
+	if m.Settings.SelectedTunnelingTool < 0 || m.Settings.SelectedTunnelingTool >= len(m.Settings.TunnelingTools) {
+		m.err = fmt.Errorf("сначала выберите средство туннелирования в настройках")
+		return nil
+	}
+
+	return m.startTunnel()
+}
+
+func (m *MainModel) startTunnel() tea.Cmd {
+	t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
+	fullPath, _ := filepath.Abs(t.Path)
+	dir := filepath.Dir(fullPath)
+	args := strings.Fields(t.Flags)
+
+	m.tunnelCmd = exec.Command(fullPath, args...)
+	m.tunnelCmd.Dir = dir
+	setProcessGroup(m.tunnelCmd)
+
+	err := m.tunnelCmd.Start()
+	if err != nil {
+		m.err = fmt.Errorf("ошибка запуска %s: %v", t.Name, err)
+		return nil
+	}
+
+	m.tunnelRunning = true
+
+	return func() tea.Msg {
+		err := m.tunnelCmd.Wait()
+		return tunnelFinishedMsg{err: err}
+	}
+}
+
+func (m *MainModel) stopTunnel() {
+	if m.tunnelCmd != nil && m.tunnelCmd.Process != nil {
+		softKill(m.tunnelCmd.Process.Pid)
+	}
+}
+
+func (m *MainModel) handleTunnelFinished(err error) {
+	m.tunnelRunning = false
+	if err != nil && !isGracefulExit(err) {
+		tName := "средство туннелирования"
+		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
+			tName = m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool].Name
+		}
+		m.err = fmt.Errorf("%s завершилось с ошибкой: %v", tName, err)
+	}
+}
+
+func (m *MainModel) handleClientFinished(err error) tea.Cmd {
+	m.setupMainMenu()
+	if err != nil && !m.manuallyStopped && !isGracefulExit(err) {
+		m.err = err
+	}
+	m.manuallyStopped = false
+	return tea.ClearScreen
+}
+
+func (m *MainModel) copyToClipboard(text string) tea.Cmd {
+	err := clipboard.WriteAll(text)
+	if err != nil {
+		m.err = fmt.Errorf("ошибка копирования в буфер обмена: %v", err)
+	}
+	return nil
 }

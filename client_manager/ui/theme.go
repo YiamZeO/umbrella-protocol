@@ -38,21 +38,21 @@ const (
 	dawnHighlight = "#cecacd"
 )
 
-// Rosé Pine (Dark) Palette
+// Rosé Pine Moon Palette
 const (
-	darkBase      = "#191724"
-	darkSurface   = "#1f1d2e"
-	darkOverlay   = "#26233a"
-	darkMuted     = "#6e6a86"
-	darkSubtle    = "#908caa"
-	darkText      = "#e0def4"
-	darkLove      = "#eb6f92"
-	darkGold      = "#f6c177"
-	darkRose      = "#ebbcba"
-	darkPine      = "#31748f"
-	darkFoam      = "#9ccfd8"
-	darkIris      = "#c4a7e7"
-	darkHighlight = "#524f67"
+	moonBase      = "#232136"
+	moonSurface   = "#2a273f"
+	moonOverlay   = "#393552"
+	moonMuted     = "#6e6a86"
+	moonSubtle    = "#908caa"
+	moonText      = "#e0def4"
+	moonLove      = "#eb6f92"
+	moonGold      = "#f6c177"
+	moonRose      = "#ea9a97"
+	moonPine      = "#3e8fb0"
+	moonFoam      = "#9ccfd8"
+	moonIris      = "#c4a7e7"
+	moonHighlight = "#56526e"
 )
 
 // Catppuccin Latte (Light) Palette
@@ -143,22 +143,22 @@ var (
 		HighlightHigh: lipgloss.Color(dawnGold),
 	}
 
-	RosePineDark = Theme{
-		Name:          "Rose Pine Dark",
-		Base:          lipgloss.Color(darkBase),
-		Surface:       lipgloss.Color(darkSurface),
-		Overlay:       lipgloss.Color(darkOverlay),
-		Muted:         lipgloss.Color(darkMuted),
-		Subtle:        lipgloss.Color(darkSubtle),
-		Text:          lipgloss.Color(darkText),
-		Love:          lipgloss.Color(darkLove),
-		Gold:          lipgloss.Color(darkGold),
-		Rose:          lipgloss.Color(darkRose),
-		Pine:          lipgloss.Color(darkPine),
-		Foam:          lipgloss.Color(darkFoam),
-		Iris:          lipgloss.Color(darkIris),
-		Highlight:     lipgloss.Color(darkHighlight),
-		HighlightHigh: lipgloss.Color(darkGold),
+	RosePineMoon = Theme{
+		Name:          "Rose Pine Moon",
+		Base:          lipgloss.Color(moonBase),
+		Surface:       lipgloss.Color(moonSurface),
+		Overlay:       lipgloss.Color(moonOverlay),
+		Muted:         lipgloss.Color(moonMuted),
+		Subtle:        lipgloss.Color(moonSubtle),
+		Text:          lipgloss.Color(moonText),
+		Love:          lipgloss.Color(moonLove),
+		Gold:          lipgloss.Color(moonGold),
+		Rose:          lipgloss.Color(moonRose),
+		Pine:          lipgloss.Color(moonPine),
+		Foam:          lipgloss.Color(moonFoam),
+		Iris:          lipgloss.Color(moonIris),
+		Highlight:     lipgloss.Color(moonHighlight),
+		HighlightHigh: lipgloss.Color(moonGold),
 	}
 
 	CatppuccinLatte = Theme{
@@ -239,7 +239,7 @@ var AvailableThemes = []Theme{
 	CatppuccinMacchiato,
 	CatppuccinFrappe,
 	CatppuccinLatte,
-	RosePineDark,
+	RosePineMoon,
 	RosePineDawn,
 }
 
