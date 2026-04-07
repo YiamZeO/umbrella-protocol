@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"client_manager/config"
 
@@ -32,6 +34,7 @@ const (
 	stateCreateTunnelName
 	stateCreateTunnelPath
 	stateCreateTunnelFlags
+	stateAskTimedMinutes
 	stateRunning
 )
 
@@ -68,6 +71,12 @@ type MainModel struct {
 	// For Tunneling Tool
 	tunnelCmd     *exec.Cmd
 	tunnelRunning bool
+
+	// For timed runs
+	isTimedRun     bool
+	returnToConfig bool
+	timedConfig    config.ClientConfig
+	remainingTime  int
 }
 
 func InitialModel(settings *config.Settings) MainModel {
@@ -213,6 +222,8 @@ func (m MainModel) Init() tea.Cmd {
 
 type logLineMsg string
 
+type tickMsg struct{}
+
 func waitForLog(c chan string) tea.Cmd {
 	return func() tea.Msg {
 		line, ok := <-c
@@ -221,6 +232,12 @@ func waitForLog(c chan string) tea.Cmd {
 		}
 		return logLineMsg(line)
 	}
+}
+
+func (m *MainModel) tick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return tickMsg{}
+	})
 }
 
 func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -245,6 +262,21 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(strings.Join(m.logLines, "\n"))
 		m.viewport.GotoBottom()
 		return m, waitForLog(m.logChan)
+
+	case tickMsg:
+		if m.isTimedRun && m.state == stateRunning {
+			m.remainingTime--
+			if m.remainingTime <= 0 {
+				m.remainingTime = 0
+				if m.clientCmd != nil && m.clientCmd.Process != nil {
+					softKill(m.clientCmd.Process.Pid)
+				}
+			}
+			if m.remainingTime > 0 {
+				return m, m.tick()
+			}
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -367,11 +399,40 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input, cmd = m.input.Update(msg)
 			return m, cmd
 
+		case stateAskTimedMinutes:
+			if msg.String() == "enter" {
+				if val := strings.TrimSpace(m.input.Value()); val != "" {
+					if mins, err := strconv.Atoi(val); err == nil && mins > 0 {
+						m.isTimedRun = true
+						m.returnToConfig = true
+						m.remainingTime = mins * 60
+						m.state = stateRunning
+						m.logLines = []string{}
+						m.viewport.SetContent("")
+						m.viewport.Width = m.terminalWidth - 6
+						m.viewport.Height = m.terminalHeight - 15
+						return m, tea.Batch(m.runClientCmd(), m.tick(), waitForLog(m.logChan))
+					} else {
+						m.err = fmt.Errorf("введите положительное целое число минут")
+						m.input.SetValue("")
+						return m, nil
+					}
+				}
+			}
+			if msg.String() == "esc" || msg.String() == "b" {
+				m.setupConfigMenu()
+				return m, nil
+			}
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+
 		case stateMainMenu:
 			switch msg.String() {
 			case "q":
 				return m, tea.Quit
 			case "r":
+				m.isTimedRun = false
+				m.returnToConfig = false
 				if m.Settings.SelectedConfig >= 0 && m.Settings.SelectedConfig < len(m.Settings.Configs) {
 					m.state = stateRunning
 					m.logLines = []string{}
@@ -399,6 +460,16 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateCreateConfigName
 				m.input.SetValue("")
 				m.input.Placeholder = "Введите имя конфигурации..."
+			case "r":
+				idx := m.list.Index()
+				if idx >= 0 && idx < len(m.Settings.Configs) {
+					m.timedConfig = m.Settings.Configs[idx]
+					m.state = stateAskTimedMinutes
+					m.input.SetValue("")
+					m.input.Placeholder = "Введите количество минут..."
+					m.err = nil
+					return m, nil
+				}
 			case "d":
 				m.deleteHoveredConfig()
 			case "o":
@@ -468,6 +539,7 @@ func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.manuallyStopped = true
 					softKill(m.clientCmd.Process.Pid)
 				}
+				m.isTimedRun = false
 				return m, nil
 			case "e":
 				return m, m.toggleTunnel()
@@ -496,7 +568,7 @@ func (m MainModel) View() string {
 
 		// Info Box
 		infoContent := fmt.Sprintf("%s %s\n", ActiveConfigLabelStyle.Render("Клиент:"), m.Settings.ClientPath)
-		
+
 		tunnelName := "не выбрано"
 		tunnelStatus := "выключено"
 		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
@@ -508,20 +580,25 @@ func (m MainModel) View() string {
 		}
 		infoContent += fmt.Sprintf("%s %s: %s\n", ActiveConfigLabelStyle.Render("Туннель:"), tunnelName, tunnelStatus)
 
-		if m.Settings.SelectedConfig >= 0 && m.Settings.SelectedConfig < len(m.Settings.Configs) {
+		if m.isTimedRun && m.remainingTime > 0 {
+			min := m.remainingTime / 60
+			sec := m.remainingTime % 60
+			timerStr := fmt.Sprintf("[%dm%ds]", min, sec)
+			infoContent += fmt.Sprintf("%s %s %s\n", ActiveConfigLabelStyle.Render("Конфиг:"), m.timedConfig.Name, timerStr)
+		} else if m.Settings.SelectedConfig >= 0 && m.Settings.SelectedConfig < len(m.Settings.Configs) {
 			cfg := m.Settings.Configs[m.Settings.SelectedConfig]
 			infoContent += fmt.Sprintf("%s %s\n", ActiveConfigLabelStyle.Render("Конфиг:"), cfg.Name)
 		} else {
 			infoContent += ErrorStyle.Render("Конфигурация не выбрана") + "\n"
 		}
 		infoContent += fmt.Sprintf("%s %s", ActiveConfigLabelStyle.Render("Тема:  "), CurrentTheme.Name)
-		
+
 		wrappedInfo := wordwrap.String(infoContent, m.terminalWidth-10)
-		s += InfoBoxStyle.Width(m.terminalWidth - 6).Render(wrappedInfo) + "\n"
+		s += InfoBoxStyle.Width(m.terminalWidth-6).Render(wrappedInfo) + "\n"
 	}
 
 	switch m.state {
-	case stateAskPath, stateCreateConfigName, stateCreateConfigFlags, stateCreateTunnelName, stateCreateTunnelPath, stateCreateTunnelFlags:
+	case stateAskPath, stateCreateConfigName, stateCreateConfigFlags, stateCreateTunnelName, stateCreateTunnelPath, stateCreateTunnelFlags, stateAskTimedMinutes:
 		s = TitleStyle.Render("Umbrella Client Manager") + "\n\n"
 		s += m.input.View() + "\n\n"
 		if m.err != nil {
@@ -531,7 +608,7 @@ func (m MainModel) View() string {
 
 	case stateMainMenu:
 		s += "\n" + StatusStyle.Render("Используйте горячие клавиши для действий")
-		
+
 		tunnelAction := "включение\\выключение"
 		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
 			t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
@@ -555,8 +632,9 @@ func (m MainModel) View() string {
 		s += m.list.View()
 
 		// Help Panel for Settings
-		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
+		s += "\n\n" + fmt.Sprintf("%s %s  %s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
 			KeyStyle.Render("enter"), DescStyle.Render("выбрать"),
+			KeyStyle.Render("r"), DescStyle.Render("запустить на время"),
 			KeyStyle.Render("c"), DescStyle.Render("создать"),
 			KeyStyle.Render("d"), DescStyle.Render("удалить"),
 			KeyStyle.Render("o"), DescStyle.Render("скопировать флаги"),
@@ -586,7 +664,7 @@ func (m MainModel) View() string {
 
 	case stateRunning:
 		s += "\n" + m.viewport.View()
-		
+
 		tunnelAction := "включение\\выключение туннеля"
 		if m.Settings.SelectedTunnelingTool >= 0 && m.Settings.SelectedTunnelingTool < len(m.Settings.TunnelingTools) {
 			t := m.Settings.TunnelingTools[m.Settings.SelectedTunnelingTool]
@@ -609,14 +687,24 @@ type clientFinishedMsg struct{ err error }
 
 func (m *MainModel) runClientCmd() tea.Cmd {
 	m.err = nil
-	
-	cfg := m.Settings.Configs[m.Settings.SelectedConfig]
+
+	var cfg config.ClientConfig
+	if m.isTimedRun {
+		cfg = m.timedConfig
+	} else if m.Settings.SelectedConfig >= 0 && m.Settings.SelectedConfig < len(m.Settings.Configs) {
+		cfg = m.Settings.Configs[m.Settings.SelectedConfig]
+	} else {
+		m.err = fmt.Errorf("конфигурация не выбрана")
+		return func() tea.Msg {
+			return clientFinishedMsg{err: fmt.Errorf("конфигурация не выбрана")}
+		}
+	}
 	args := strings.Fields(cfg.Flags)
 	fullPath, _ := filepath.Abs(m.Settings.ClientPath)
 
 	m.clientCmd = exec.Command(fullPath, args...)
 	setProcessGroup(m.clientCmd)
-	
+
 	stdout, _ := m.clientCmd.StdoutPipe()
 	stderr, _ := m.clientCmd.StderrPipe()
 
@@ -705,7 +793,15 @@ func (m *MainModel) handleTunnelFinished(err error) {
 }
 
 func (m *MainModel) handleClientFinished(err error) tea.Cmd {
-	m.setupMainMenu()
+	if m.returnToConfig {
+		m.setupConfigMenu()
+		m.returnToConfig = false
+	} else {
+		m.setupMainMenu()
+	}
+	m.isTimedRun = false
+	m.remainingTime = 0
+	m.timedConfig = config.ClientConfig{}
 	if err != nil && !m.manuallyStopped && !isGracefulExit(err) {
 		m.err = err
 	}
