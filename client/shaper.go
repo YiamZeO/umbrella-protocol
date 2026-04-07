@@ -93,17 +93,6 @@ func randPhaseDuration(p Phase) time.Duration {
 	return p.MinDuration + time.Duration(n.Int64())
 }
 
-// randGapDuration returns a random inter-phase gap in [1, 10) seconds.
-func randGapDuration() time.Duration {
-	const minGap = 1 * time.Second
-	const maxGap = 10 * time.Second
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxGap-minGap)))
-	if err != nil {
-		return minGap
-	}
-	return minGap + time.Duration(n.Int64())
-}
-
 // gUpBucket is the current upload rate bucket, atomically replaced on each phase change.
 // nil means no throttling (default/fallback behaviour).
 var gUpBucket atomic.Pointer[rateBucket]
@@ -189,28 +178,10 @@ func (b *rateBucket) refund(n int64) {
 	b.mu.Unlock()
 }
 
-// phaseCancel tracks the stop channel for the currently active phase timer.
-var (
-	phaseCancel   chan struct{}
-	phaseCancelMu sync.Mutex
-)
-
-// cancelCurrentPhase stops the active phase timer goroutine if any.
-func cancelCurrentPhase() {
-	phaseCancelMu.Lock()
-	defer phaseCancelMu.Unlock()
-	if phaseCancel != nil {
-		close(phaseCancel)
-		phaseCancel = nil
-	}
-}
-
 // applyPhase updates the global rate buckets with new limits and starts a local
 // expiration timer for the phase. This is used by both the old server-driven and
 // the new local engine.
 func applyPhase(downMbps, upMbps float32, dur time.Duration, name string) {
-	cancelCurrentPhase()
-
 	newUpBucket := newRateBucket(float64(upMbps) * 125_000)
 	if old := gUpBucket.Swap(newUpBucket); old != nil {
 		close(old.done)
@@ -221,43 +192,12 @@ func applyPhase(downMbps, upMbps float32, dur time.Duration, name string) {
 		close(old.done)
 	}
 
-	cancelCh := make(chan struct{})
-	phaseCancelMu.Lock()
-	phaseCancel = cancelCh
-	phaseCancelMu.Unlock()
-
-	upBucket := newUpBucket     // capture for CAS
-	downBucket := newDownBucket // capture for CAS
-	go func() {
-		select {
-		case <-time.After(dur):
-			// Phase expired: revert to no-throttle only if our bucket is still active.
-			upExpired := gUpBucket.CompareAndSwap(upBucket, nil)
-			if upExpired {
-				close(upBucket.done)
-			}
-			downExpired := gDownBucket.CompareAndSwap(downBucket, nil)
-			if downExpired {
-				close(downBucket.done)
-			}
-			if upExpired || downExpired {
-				log.Printf("[shaper] phase expired → fallback (no throttle)")
-			}
-		case <-cancelCh:
-			// New phase arrived before this one expired.
-		}
-		phaseCancelMu.Lock()
-		if phaseCancel == cancelCh {
-			phaseCancel = nil
-		}
-		phaseCancelMu.Unlock()
-	}()
 	log.Printf("[shaper] → %s (%.1f↓ %.1f↑ Mbps, %s)", name, downMbps, upMbps, dur.Round(time.Millisecond))
 }
 
 // runShaperEngine runs the phase selection loop locally on the client.
 // No control stream to server is needed anymore. Phases are chosen randomly
-// (avoiding consecutive repeats), applied for random duration, then a gap.
+// (avoiding consecutive repeats), applied for random duration.
 func runShaperEngine() {
 	lastIdx := -1
 	for {
@@ -273,10 +213,6 @@ func runShaperEngine() {
 
 		time.Sleep(dur)
 
-		// Inter-phase gap: reset to no-throttle, wait before next phase.
-		gap := randGapDuration()
-		log.Printf("[shaper] gap %s before next phase", gap.Round(time.Millisecond))
-		time.Sleep(gap)
 		lastIdx = idx
 	}
 }

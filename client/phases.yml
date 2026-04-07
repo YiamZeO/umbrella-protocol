@@ -6,13 +6,13 @@ idle:
 
 page_load:
   min_duration: 1
-  max_duration: 5
+  max_duration: 2
   down_mbps: 12.0
   up_mbps: 0.8
 
 images:
   min_duration: 1
-  max_duration: 5
+  max_duration: 2
   down_mbps: 6.0
   up_mbps: 0.1
 
