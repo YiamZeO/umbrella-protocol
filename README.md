@@ -241,7 +241,7 @@ SOCKS5 прокси поверх TCP:443 с [Reality](https://github.com/XTLS/RE
 
 ```bash
 cd umbrella_server
-GOOS=linux GOARCH=amd64 go build -o umbrella-server .
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o cd umbrella_server .
 ```
 
 ### Umbrella Client
