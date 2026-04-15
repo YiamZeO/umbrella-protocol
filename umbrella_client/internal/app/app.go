@@ -468,13 +468,13 @@ func CreateAndRun() {
 		}
 	})
 
-	var timerWin fyne.Window
-	timerBtn := widget.NewButtonWithIcon("Timer", theme.CalendarIcon(), func() {
-		if timerWin != nil {
-			timerWin.Close()
+	var presetsWin fyne.Window
+	presetsBtn := widget.NewButtonWithIcon("Presets", theme.FileIcon(), func() {
+		if presetsWin != nil {
+			presetsWin.Close()
 		}
-		timerWin = windows.NewTimerWindow(myApp, appSettings)
-		timerWin.Show()
+		presetsWin = windows.NewPresetsWindow(myApp, appSettings, &lg)
+		presetsWin.Show()
 	})
 
 	var settingsWin fyne.Window
@@ -489,7 +489,7 @@ func CreateAndRun() {
 	// Layout
 	top := container.NewVBox(
 		statusLabel,
-		container.NewGridWithColumns(4, startBtn, stopBtn, timerBtn, settingsBtn),
+		container.NewGridWithColumns(4, startBtn, stopBtn, presetsBtn, settingsBtn),
 	)
 	bottom := container.NewGridWithColumns(4, copyBtn, clearBtn, decBtn, incBtn)
 

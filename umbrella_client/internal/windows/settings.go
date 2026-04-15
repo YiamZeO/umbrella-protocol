@@ -238,13 +238,13 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 		fontsWin.Show()
 	})
 
-	var presetsWin fyne.Window
-	presetsBtn := widget.NewButtonWithIcon("Presets", theme.FileIcon(), func() {
-		if presetsWin != nil {
-			presetsWin.Close()
+	var timerWin fyne.Window
+	timerBtn := widget.NewButtonWithIcon("Timer", theme.CalendarIcon(), func() {
+		if timerWin != nil {
+			timerWin.Close()
 		}
-		presetsWin = NewPresetsWindow(appRef, appSettings, l)
-		presetsWin.Show()
+		timerWin = NewTimerWindow(appRef, appSettings)
+		timerWin.Show()
 	})
 
 	var tunnelCoreWin fyne.Window
@@ -265,7 +265,7 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 		phasesBtn,
 		themeBtn,
 		fontsBtn,
-		presetsBtn,
+		timerBtn,
 	)
 
 	if runtime.GOOS != "android" {
