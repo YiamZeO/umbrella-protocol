@@ -226,7 +226,7 @@ SOCKS5 прокси поверх TCP:443 с [Reality](https://github.com/XTLS/RE
 - Можно запустить как обычной socks сервер и подключать к нему приложения через настройки или расширение браузера. 
 - Можно скачать одно из средств туннелирования отмеченных выше, в папке с ним настроить для него конфиг, указать в настройках `Tunnel core` клиента путь к нему. Umbrella client будет сам включать и выключать его между запусками.
 
-**Лучше запускать от имени администратора. При использовании `Tunnel core` это обязательно**
+**Поставьте в свойствах запуск от имени администратора. Это нужно для выполнения некоторых функций приложения и запусков `Tunnel core`**
 
 ### Android
 Тут будет немного сложно. Само приложение устанавливается и работает, но поскольку у `fyne` [нет интеграции со специальным android сервисом](https://github.com/fyne-io/fyne/discussions/5221), приложение не будет корректно работать в фоне и при выключенном экране, если ничего не сделать. Если предпринять шаги описанные в [этой инструкции](./android_fix.md), то приложение начнет нормально жить и работать. **Но стабильность все равно не гарантирована.**
@@ -241,7 +241,7 @@ SOCKS5 прокси поверх TCP:443 с [Reality](https://github.com/XTLS/RE
 
 ```bash
 cd umbrella_server
-$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o cd umbrella_server .
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o umbrella_server .
 ```
 
 ### Umbrella Client
@@ -249,8 +249,8 @@ $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o cd umbrella_server .
 #### Windows
 
 ```bash
-cd umbrella_client/cmd/ui
-go build -ldflags="-H=windowsgui" -o umbrella-client.exe
+cd umbrella_client
+go build -ldflags="-H=windowsgui" -o umbrella-client.exe ./cmd/ui
 ```
 
 #### Android

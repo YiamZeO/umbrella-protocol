@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -122,6 +123,29 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 		l.AppendLog("[System] Starting client...")
 		err := client.Start(cfg, ctx)
 		if err != nil {
+			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
+				if runtime.GOOS != "android" {
+					switch runtime.GOOS {
+					case "windows":
+						errR := exec.Command("net", "stop", "winnat").Run()
+						if errR == nil {
+							errR = exec.Command("net", "start", "winnat").Run()
+						}
+						if errR != nil {
+							l.AppendLog("[Error] Failed net command: " + errR.Error())
+							finish("Status: Failed net command", isRunning, l, startEnabled, stopEnabled)
+							return
+						}
+					case "linux":
+						if errR := exec.Command("sh", "-c", "fuser -k 1080/tcp").Run(); errR != nil {
+							l.AppendLog("[Error] Failed net sh: " + errR.Error())
+							finish("Status: Failed net sh", isRunning, l, startEnabled, stopEnabled)
+							return
+						}
+					}
+					err = client.Start(cfg, ctx)
+				}
+			}
 			l.AppendLog(fmt.Sprintf("[Error] Client failed to start: %v", err))
 			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
 		} else {
