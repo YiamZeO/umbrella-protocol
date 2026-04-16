@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 )
@@ -187,4 +190,78 @@ func SavePhases(b []byte, appFilesDir string, appRef fyne.App) error {
 		}
 	}
 	return nil
+}
+
+func DnsCacheFilePath(appFilesDir string) string {
+	if appFilesDir == "" {
+		return "dns_cache.json"
+	}
+	return filepath.Join(appFilesDir, "dns_cache.json")
+}
+
+type dnsCacheFile struct {
+	Data      map[string]string `json:"data"`
+	Timestamp time.Time         `json:"timestamp"`
+}
+
+func LoadDnsCache(appFilesDir string) (*sync.Map, error) {
+	p := DnsCacheFilePath(appFilesDir)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return &sync.Map{}, nil
+	}
+	var cf dnsCacheFile
+	if err := json.Unmarshal(b, &cf); err != nil {
+		return &sync.Map{}, err
+	}
+	m := &sync.Map{}
+	for k, v := range cf.Data {
+		m.Store(k, v)
+	}
+	return m, nil
+}
+
+func SaveDnsCache(m *sync.Map, appFilesDir string) error {
+	p := DnsCacheFilePath(appFilesDir)
+
+	if appFilesDir != "" {
+		_ = os.MkdirAll(appFilesDir, 0o755)
+	}
+
+	data := make(map[string]string)
+	m.Range(func(k, v interface{}) bool {
+		if key, ok := k.(string); ok {
+			if val, ok := v.(string); ok {
+				data[key] = val
+			}
+		}
+		return true
+	})
+
+	existing, err := os.ReadFile(p)
+	if err == nil && len(existing) > 0 {
+		var cf dnsCacheFile
+		if err := json.Unmarshal(existing, &cf); err == nil {
+			if time.Since(cf.Timestamp) < 24*time.Hour {
+				for k, v := range data {
+					cf.Data[k] = v
+				}
+				b, err := json.Marshal(cf)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(p, b, 0o644)
+			}
+		}
+	}
+
+	cf := dnsCacheFile{
+		Data:      data,
+		Timestamp: time.Now(),
+	}
+	b, err := json.Marshal(cf)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0o644)
 }

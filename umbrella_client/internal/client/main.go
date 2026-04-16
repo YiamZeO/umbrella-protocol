@@ -43,7 +43,6 @@ var (
 	gSessionsNum          int
 	gDecoyTraffic         bool
 	gBypass               []string
-	gDNSCache             sync.Map // map[string]string: IP -> Hostname
 	gDNSListen            string
 	gDNSUpstream          string
 	gDNSUpstreamForBypass string
@@ -51,7 +50,6 @@ var (
 	sessMu       []sync.Mutex
 	getSessionMu sync.Mutex // Global lock to prevent simultaneous session establishment
 	sessions     []*yamux.Session
-	activeConns  sync.Map // map[net.Conn]struct{}
 	wg           sync.WaitGroup
 )
 
@@ -117,7 +115,7 @@ func ParseConfig(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
-func Start(cfg *Config, ctx context.Context) error {
+func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *sync.Map) error {
 	mrand.Seed(time.Now().UnixNano())
 
 	gUDPEnabled = cfg.UDPEnabled
@@ -159,8 +157,6 @@ func Start(cfg *Config, ctx context.Context) error {
 	}
 	sessMu = make([]sync.Mutex, gSessionsNum)
 	sessions = make([]*yamux.Session, gSessionsNum)
-	gDNSCache = sync.Map{}
-	activeConns = sync.Map{}
 
 	if gShaper {
 		if cfg.PhasesData != nil {
@@ -197,7 +193,7 @@ func Start(cfg *Config, ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runDNSServer(ctx)
+			runDNSServer(ctx, dnsCache)
 		}()
 	}
 
@@ -206,14 +202,6 @@ func Start(cfg *Config, ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		ln.Close()
-		// Close all active connections
-		activeConns.Range(func(key, value any) bool {
-			if conn, ok := key.(net.Conn); ok {
-				go conn.Close()
-			}
-			return true
-		})
-		// Clean up sessions
 		for i := 0; i < gSessionsNum; i++ {
 			sessMu[i].Lock()
 			if sessions[i] != nil {
@@ -237,7 +225,6 @@ func Start(cfg *Config, ctx context.Context) error {
 			case <-ch:
 				return nil
 			case <-time.After(10 * time.Second):
-				log.Printf("[WARN] Server closing too long")
 				return nil
 			}
 		default:
@@ -265,7 +252,7 @@ func Start(cfg *Config, ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				handleSocks5(ctx, conn)
+				handleSocks5(ctx, conn, dnsCache)
 			}()
 		}
 	}
@@ -318,27 +305,21 @@ func handleDirect(ctx context.Context, conn net.Conn, host string, port uint16) 
 		log.Printf("[ERR] Direct dial %s error: %v", target, err)
 		return
 	}
-	activeConns.Store(remote, struct{}{})
 	defer func() {
-		activeConns.Delete(remote)
 		go remote.Close()
 	}()
 
 	log.Printf("Direct connection %s → %s", conn.RemoteAddr(), target)
 
 	done := make(chan struct{}, 2)
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		b := copyBufPool.Get().(*[]byte)
 		io.CopyBuffer(remote, conn, *b)
 		copyBufPool.Put(b)
 		closeWrite(remote)
 		done <- struct{}{}
 	}()
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		b := copyBufPool.Get().(*[]byte)
 		io.CopyBuffer(conn, remote, *b)
 		copyBufPool.Put(b)
@@ -752,7 +733,7 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 // It opens a yamux UDP relay stream to the server, binds a local UDP socket,
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
-func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
+func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *sync.Map) {
 	var (
 		err    error
 		s      *yamux.Session
@@ -779,9 +760,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
 		return
 	}
 
-	activeConns.Store(stream, struct{}{})
 	defer func() {
-		activeConns.Delete(stream)
 		go stream.Close()
 	}()
 
@@ -812,9 +791,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
 	}
 
 	// App → Server (Dynamic routing)
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		buf := make([]byte, 65535)
 		frameBuf := make([]byte, 4+65535)
 		for {
@@ -878,7 +855,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
 			}
 
 			// Try DNS cache
-			if originalHost, ok := gDNSCache.Load(host); ok {
+			if originalHost, ok := dnsCache.Load(host); ok {
 				host = originalHost.(string)
 			}
 
@@ -903,9 +880,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
 	}()
 
 	// Server → App (Tunnel responses)
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		lenBuf := make([]byte, 4)
 		pktBuf := make([]byte, 3+65535)
 		for {
@@ -955,10 +930,8 @@ func closeWrite(c net.Conn) {
 }
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
-func handleSocks5(ctx context.Context, conn net.Conn) {
-	activeConns.Store(conn, struct{}{})
+func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *sync.Map) {
 	defer func() {
-		activeConns.Delete(conn)
 		go conn.Close()
 	}()
 
@@ -969,13 +942,13 @@ func handleSocks5(ctx context.Context, conn net.Conn) {
 	}
 
 	// Try to resolve IP to hostname from DNS cache for better logging and bypass
-	if originalHost, ok := gDNSCache.Load(host); ok {
+	if originalHost, ok := dnsCache.Load(host); ok {
 		log.Printf("Resolved %s → %s (from DNS cache)", host, originalHost)
 		host = originalHost.(string)
 	}
 
 	if cmd == 0x03 { // UDP ASSOCIATE
-		handleSocks5UDP(ctx, conn)
+		handleSocks5UDP(ctx, conn, dnsCache)
 		return
 	}
 
@@ -1025,9 +998,7 @@ func handleSocks5(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	activeConns.Store(stream, struct{}{})
 	defer func() {
-		activeConns.Delete(stream)
 		go stream.Close()
 	}()
 
@@ -1035,9 +1006,7 @@ func handleSocks5(ctx context.Context, conn net.Conn) {
 
 	done := make(chan struct{}, 2)
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		b := copyBufPool.Get().(*[]byte)
 		var dst io.Writer = stream
 		if gShaper {
@@ -1048,9 +1017,7 @@ func handleSocks5(ctx context.Context, conn net.Conn) {
 		closeWrite(stream)
 		done <- struct{}{}
 	}()
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		b := copyBufPool.Get().(*[]byte)
 		var src io.Reader = stream
 		if gShaper {

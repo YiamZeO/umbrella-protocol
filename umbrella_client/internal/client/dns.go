@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -15,7 +16,7 @@ import (
 
 // runDNSServer starts a local DNS server that resolves queries via the tunnel.
 // It populates gDNSCache with IP -> Hostname mappings to fix bypass-by-host.
-func runDNSServer(ctx context.Context) {
+func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		msg := new(dns.Msg)
 		msg.SetReply(r)
@@ -71,7 +72,7 @@ func runDNSServer(ctx context.Context) {
 				ip = aaaa.AAAA.String()
 			}
 			if ip != "" {
-				gDNSCache.Store(ip, hostname)
+				dnsCache.Store(ip, hostname)
 			}
 		}
 
@@ -85,43 +86,19 @@ func runDNSServer(ctx context.Context) {
 	}
 
 	log.Printf("DNS server listening on %s (upstream: %s)", gDNSListen, gDNSUpstream)
-	go runDNSCacheCleaner(ctx)
-	
+
 	go func() {
 		<-ctx.Done()
 		log.Printf("DNS: shutting down server...")
 		server.Shutdown()
 	}()
-	
+
 	if err := server.ListenAndServe(); err != nil {
 		select {
 		case <-ctx.Done():
 			log.Printf("DNS: server stopped")
 		default:
 			log.Printf("[ERR] DNS server error: %v", err)
-		}
-	}
-}
-
-// runDNSCacheCleaner periodically clears the DNS cache to prevent memory leaks
-// and handle dynamic IP changes.
-func runDNSCacheCleaner(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			count := 0
-			gDNSCache.Range(func(key, value any) bool {
-				gDNSCache.Delete(key)
-				count++
-				return true
-			})
-			if count > 0 {
-				log.Printf("DNS Cache: periodically cleared %d entries", count)
-			}
 		}
 	}
 }

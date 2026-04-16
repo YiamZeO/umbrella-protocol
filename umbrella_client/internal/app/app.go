@@ -101,14 +101,14 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 
 	// Run client in a goroutine
 	go func() {
+		dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
+		if err != nil {
+			l.AppendLog("[Error] Failed load dns cache: " + err.Error())
+			finish("Status: Failed load dns cache", isRunning, l, startEnabled, stopEnabled)
+			return
+		}
+
 		defer func() {
-			if appSettings.TunnelCorePath != "" {
-				if err := tunnel.StopTunnelCore(pr); err == nil {
-					l.AppendLog("[System] Tunnel core stopped")
-				} else {
-					l.AppendLog("[ERR] Tunnel core not stopped. Need a manual stop process. " + err.Error())
-				}
-			}
 			// Ensure we always call finish and handle panics
 			if r := recover(); r != nil {
 				l.AppendLog(fmt.Sprintf("[Panic] Client crashed: %v", r))
@@ -118,10 +118,21 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 				l.AppendLog("[System] Client stopped, updating status")
 				finish("Status: Stopped", isRunning, l, startEnabled, stopEnabled)
 			}
+			if appSettings.TunnelCorePath != "" {
+				if err := tunnel.StopTunnelCore(pr); err == nil {
+					l.AppendLog("[System] Tunnel core stopped")
+				} else {
+					l.AppendLog("[ERR] Tunnel core not stopped. Need a manual stop process. " + err.Error())
+				}
+			}
+			err := storage.SaveDnsCache(dnsCache, appSettings.AppFilesDir)
+			if err != nil {
+				l.AppendLog("[Error] Failed save dns cache: " + err.Error())
+			}
 		}()
 
 		l.AppendLog("[System] Starting client...")
-		err := client.Start(cfg, ctx)
+		err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 		if err != nil {
 			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
 				if runtime.GOOS != "android" {
@@ -143,7 +154,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 							return
 						}
 					}
-					err = client.Start(cfg, ctx)
+					err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 				}
 			}
 			l.AppendLog(fmt.Sprintf("[Error] Client failed to start: %v", err))
