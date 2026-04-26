@@ -41,24 +41,24 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	})
 	err := os.MkdirAll(appSettings.AppFilesDir, 0o755)
 	if err != nil {
-		l.AppendLog("[Error] Failed to create directory: " + err.Error())
+		l.AppendLog("[ERR] Failed to create directory: " + err.Error())
 		finish("Status: Directory Error", isRunning, l, startEnabled, stopEnabled)
 		return
 	}
 
-	l.AppendLog("[System] Loading config.yaml from storage/disk...")
+	l.AppendLog("Loading config.yaml from storage/disk...")
 
 	configData, err := storage.LoadConfig(appSettings.AppFilesDir, appRef)
 	if err != nil {
-		l.AppendLog("[Error] Cannot read config.yaml: " + err.Error())
+		l.AppendLog("[ERR] Cannot read config.yaml: " + err.Error())
 		finish("Status: Config Error", isRunning, l, startEnabled, stopEnabled)
 		return
 	}
 
-	l.AppendLog("[System] Parsing configuration...")
+	l.AppendLog("Parsing configuration...")
 	cfg, err := client.ParseConfig(configData)
 	if err != nil {
-		l.AppendLog("[Error] Config parse failed: " + err.Error())
+		l.AppendLog("[ERR] Config parse failed: " + err.Error())
 		finish("Status: Config Error", isRunning, l, startEnabled, stopEnabled)
 		return
 	}
@@ -66,7 +66,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	// Load phases data from storage/disk (required)
 	phasesData, err := storage.LoadPhases(appSettings.AppFilesDir, appRef)
 	if err != nil {
-		l.AppendLog("[Error] Cannot read phases.yml: " + err.Error())
+		l.AppendLog("[ERR] Cannot read phases.yml: " + err.Error())
 		finish("Status: Phases Error", isRunning, l, startEnabled, stopEnabled)
 		return
 	}
@@ -78,22 +78,22 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	}
 
 	// Log what will be started
-	l.AppendLog(fmt.Sprintf("[System] Starting client on %s", cfg.ListenAddr))
+	l.AppendLog(fmt.Sprintf("Starting client on %s", cfg.ListenAddr))
 	if cfg.DNSListen != "" {
-		l.AppendLog(fmt.Sprintf("[System] DNS server on %s", cfg.DNSListen))
+		l.AppendLog(fmt.Sprintf("DNS server on %s", cfg.DNSListen))
 	}
 	if cfg.Shaper {
-		l.AppendLog("[System] Traffic shaping: enabled")
+		l.AppendLog("Traffic shaping: enabled")
 	}
 	if cfg.DecoyTraffic {
-		l.AppendLog("[System] Decoy traffic: enabled")
+		l.AppendLog("Decoy traffic: enabled")
 	}
 
 	// Start tunnel core if configured
 	var pr *os.Process
 	if appSettings.TunnelCorePath != "" {
 		if pr, err = tunnel.StartTunnelCore(appSettings.TunnelCorePath, appSettings.TunnelCoreArgs, l); err != nil {
-			l.AppendLog("[Error] Failed to start tunnel core: " + err.Error())
+			l.AppendLog("[ERR] Failed to start tunnel core: " + err.Error())
 			finish("Status: Tunnel Core Error", isRunning, l, startEnabled, stopEnabled)
 			return
 		}
@@ -103,7 +103,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	go func() {
 		dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
 		if err != nil {
-			l.AppendLog("[Error] Failed load dns cache: " + err.Error())
+			l.AppendLog("[ERR] Failed load dns cache: " + err.Error())
 			finish("Status: Failed load dns cache", isRunning, l, startEnabled, stopEnabled)
 			return
 		}
@@ -115,23 +115,23 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 				finish("Status: Crashed", isRunning, l, startEnabled, stopEnabled)
 			} else if *isRunning {
 				// Normal exit
-				l.AppendLog("[System] Client stopped, updating status")
+				l.AppendLog("Client stopped, updating status")
 				finish("Status: Stopped", isRunning, l, startEnabled, stopEnabled)
 			}
 			if appSettings.TunnelCorePath != "" {
 				if err := tunnel.StopTunnelCore(pr); err == nil {
-					l.AppendLog("[System] Tunnel core stopped")
+					l.AppendLog("Tunnel core stopped")
 				} else {
 					l.AppendLog("[ERR] Tunnel core not stopped. Need a manual stop process. " + err.Error())
 				}
 			}
 			err := storage.SaveDnsCache(dnsCache, appSettings.AppFilesDir)
 			if err != nil {
-				l.AppendLog("[Error] Failed save dns cache: " + err.Error())
+				l.AppendLog("[ERR] Failed save dns cache: " + err.Error())
 			}
 		}()
 
-		l.AppendLog("[System] Starting client...")
+		l.AppendLog("Starting client...")
 		err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 		if err != nil {
 			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
@@ -143,13 +143,13 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 							errR = exec.Command("net", "start", "winnat").Run()
 						}
 						if errR != nil {
-							l.AppendLog("[Error] Failed net command: " + errR.Error())
+							l.AppendLog("[ERR] Failed net command: " + errR.Error())
 							finish("Status: Failed net command", isRunning, l, startEnabled, stopEnabled)
 							return
 						}
 					case "linux":
 						if errR := exec.Command("sh", "-c", "fuser -k 1080/tcp").Run(); errR != nil {
-							l.AppendLog("[Error] Failed net sh: " + errR.Error())
+							l.AppendLog("[ERR] Failed net sh: " + errR.Error())
 							finish("Status: Failed net sh", isRunning, l, startEnabled, stopEnabled)
 							return
 						}
@@ -157,10 +157,10 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 					err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 				}
 			}
-			l.AppendLog(fmt.Sprintf("[Error] Client failed to start: %v", err))
+			l.AppendLog(fmt.Sprintf("[ERR] Client failed to start: %v", err))
 			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
 		} else {
-			l.AppendLog("[System] Client stopped gracefully")
+			l.AppendLog("Client stopped gracefully")
 			// Only call finish if we're still running (not already stopped)
 			if *isRunning {
 				finish("Status: Stopped", isRunning, l, startEnabled, stopEnabled)
@@ -174,7 +174,7 @@ func finish(status string, isRunning *bool, l *logging.LogsContainer, startEnabl
 	l.StatusBind.Set(status)
 	startEnabled.Set(true)
 	stopEnabled.Set(false)
-	l.AppendLog(fmt.Sprintf("[System] Client status: %s", strings.TrimPrefix(status, "Status: ")))
+	l.AppendLog(fmt.Sprintf("Client status: %s", strings.TrimPrefix(status, "Status: ")))
 }
 
 func CreateAndRun() {
@@ -302,7 +302,7 @@ func CreateAndRun() {
 				objs := []fyne.CanvasObject{}
 				for _, line := range lines {
 					col := ui.ColorToNRGBA(ui.CurrentTheme.Gold)
-					if strings.Contains(line, "[ERR]") || strings.Contains(line, "[Error]") || strings.Contains(line, "[ERROR]") {
+					if strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERROR]") {
 						col = ui.ColorToNRGBA(ui.CurrentTheme.Love)
 					}
 
@@ -380,7 +380,7 @@ func CreateAndRun() {
 
 	stopFunc := func() {
 		if cancelFunc != nil {
-			lg.AppendLog("[System] Stopping client...")
+			lg.AppendLog("Stopping client...")
 			lg.StatusBind.Set("Status: Stopping...")
 			startEnabled.Set(false)
 			stopEnabled.Set(false)
@@ -541,9 +541,9 @@ func CreateAndRun() {
 
 	lg.AppendLog("--- Umbrella Client Ready ---")
 	if runtime.GOOS == "android" {
-		lg.AppendLog("[System] Running on Android")
+		lg.AppendLog("Running on Android")
 	} else {
-		lg.AppendLog("[System] Running on " + runtime.GOOS)
+		lg.AppendLog("Running on " + runtime.GOOS)
 	}
 	lg.AppendLog("Storage: " + appFilesDir)
 	lg.AppendLog("Click 'Start' to begin")

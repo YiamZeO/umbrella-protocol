@@ -43,22 +43,22 @@ func NewPresetsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *log
 			widget.NewLabel(name),
 			widget.NewButton("Load", func() {
 				if err := appSettings.LoadPreset(name, appRef); err != nil {
-					l.AppendLog("[Error] Failed to load preset: " + err.Error())
+					l.AppendLog("[ERR] Failed to load preset: " + err.Error())
 					dialogs.ShowStyledError(presetsEditor, "Load Error", err.Error())
 					return
 				}
-				l.AppendLog("[System] Loaded preset: " + name)
+				l.AppendLog("Loaded preset: " + name)
 				appRef.SendNotification(fyne.NewNotification("Preset Loaded", name))
 				presetListBox.Refresh()
 				currentPresetLbl.SetText("Current preset: " + appSettings.CurrentPreset)
 			}),
 			widget.NewButton("Delete", func() {
 				if err := appSettings.DeletePreset(name, appRef); err != nil {
-					l.AppendLog("[Error] Failed to delete preset: " + err.Error())
+					l.AppendLog("[ERR] Failed to delete preset: " + err.Error())
 					dialogs.ShowStyledError(presetsEditor, "Delete Error", err.Error())
 					return
 				}
-				l.AppendLog("[System] Deleted preset: " + name)
+				l.AppendLog("Deleted preset: " + name)
 				presetListBox.Objects = nil
 				for _, n := range appSettings.Presets {
 					itemRow := container.NewHBox(

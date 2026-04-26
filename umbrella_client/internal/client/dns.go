@@ -8,15 +8,16 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"umbrella_client/internal/storage"
 )
 
 // runDNSServer starts a local DNS server that resolves queries via the tunnel.
-// It populates gDNSCache with IP -> Hostname mappings to fix bypass-by-host.
-func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
+// It populates dnsCache with IP -> Hostname mappings to fix bypass-by-host.
+func runDNSServer(ctx context.Context, dnsCache *storage.DnsCache) {
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		msg := new(dns.Msg)
 		msg.SetReply(r)
@@ -31,7 +32,7 @@ func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 		hostname := strings.TrimSuffix(q.Name, ".")
 
 		// Should we resolve this via a separate bypass DNS?
-		useBypassDNS := gDNSUpstreamForBypass != "" && shouldBypass(hostname)
+		useBypassDNS := shouldBypass(hostname)
 
 		// Only handle A (IPv4) and AAAA (IPv6) for caching
 		if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
@@ -39,7 +40,7 @@ func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 			var resp *dns.Msg
 			var err error
 			if useBypassDNS {
-				resp, err = resolveDirectDNS(r, gDNSUpstreamForBypass)
+				resp, err = resolveDirectDNS(r)
 			} else {
 				resp, err = forwardDNS(ctx, r)
 			}
@@ -52,13 +53,13 @@ func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 		var resp *dns.Msg
 		var err error
 		if useBypassDNS {
-			resp, err = resolveDirectDNS(r, gDNSUpstreamForBypass)
+			resp, err = resolveDirectDNS(r)
 		} else {
 			resp, err = forwardDNS(ctx, r)
 		}
 
 		if err != nil {
-			log.Printf("[ERR] DNS: resolution error for %s (bypassDNS=%v): %v", q.Name, useBypassDNS, err)
+			log.Printf("[ERR] DNS: resolution error for %s (bypassDNS=%v): %v", hostname, useBypassDNS, err)
 			dns.HandleFailed(w, r)
 			return
 		}
@@ -73,6 +74,9 @@ func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 			}
 			if ip != "" {
 				dnsCache.Store(ip, hostname)
+				dnsCache.SetRevertValue(hostname, ip)
+				log.Printf("DNS: resolution success for %s (bypassDNS=%v): %s", hostname, useBypassDNS, ip)
+				break
 			}
 		}
 
@@ -103,14 +107,47 @@ func runDNSServer(ctx context.Context, dnsCache *sync.Map) {
 	}
 }
 
-// resolveDirectDNS sends a DNS query directly to the specified server (bypassing the tunnel).
-func resolveDirectDNS(r *dns.Msg, upstream string) (*dns.Msg, error) {
-	c := new(dns.Client)
-	c.Timeout = 5 * time.Second
-	resp, _, err := c.Exchange(r, upstream)
-	if err != nil {
-		return nil, err
+// resolveDirectDNS отправляет DNS-запрос через системный резолвер ОС
+func resolveDirectDNS(r *dns.Msg) (*dns.Msg, error) {
+	// 1. Проверяем наличие вопросов в пакете
+	if len(r.Question) == 0 {
+		return nil, fmt.Errorf("empty DNS question")
 	}
+
+	domain := r.Question[0].Name // Берём запрашиваемый домен
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 2. Создаём резолвер
+	resolver := &net.Resolver{}
+	resolver.PreferGo = false
+
+	// 3. Выполняем системный резолвинг
+	ips, err := resolver.LookupIPAddr(ctx, domain)
+	if err != nil {
+		return nil, fmt.Errorf("system resolve failed: %w", err)
+	}
+
+	// 4. Формируем ответ в формате *dns.Msg
+	resp := new(dns.Msg)
+	resp.SetReply(r)
+	resp.Authoritative = false
+
+	for _, ip := range ips {
+		// Проверяем тип IP и добавляем соответствующую запись в массив Answer
+		if ip4 := ip.IP.To4(); ip4 != nil {
+			resp.Answer = append(resp.Answer, &dns.A{
+				Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+				A:   ip4,
+			})
+		} else if ip6 := ip.IP.To16(); ip6 != nil {
+			resp.Answer = append(resp.Answer, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: domain, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+				AAAA: ip6,
+			})
+		}
+	}
+
 	return resp, nil
 }
 

@@ -25,6 +25,8 @@ import (
 	"github.com/hashicorp/yamux"
 	utls "github.com/refraction-networking/utls"
 	"gopkg.in/yaml.v3"
+
+	"umbrella_client/internal/storage"
 )
 
 // copyBufPool holds reusable 32 KiB buffers for bidirectional TCP proxying.
@@ -32,46 +34,43 @@ var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return
 
 // Global session state — all SOCKS5 connections share one TLS connection.
 var (
-	gServerAddr           string
-	gSNI                  string
-	gServerPubKey         []byte
-	gShortId              [8]byte
-	gUDPEnabled           bool
-	gCloseOnRotate        bool
-	gShaper               bool
-	gConnectionsTimeOut   time.Duration
-	gSessionsNum          int
-	gDecoyTraffic         bool
-	gBypass               []string
-	gDNSListen            string
-	gDNSUpstream          string
-	gDNSUpstreamForBypass string
-
-	sessMu       []sync.Mutex
-	getSessionMu sync.Mutex // Global lock to prevent simultaneous session establishment
-	sessions     []*yamux.Session
-	wg           sync.WaitGroup
+	gServerAddr         string
+	gSNI                string
+	gServerPubKey       []byte
+	gShortId            [8]byte
+	gUDPEnabled         bool
+	gCloseOnRotate      bool
+	gShaper             bool
+	gConnectionsTimeOut time.Duration
+	gSessionsNum        int
+	gDecoyTraffic       bool
+	gBypass             []string
+	gDNSListen          string
+	gDNSUpstream        string
+	sessMu              []sync.Mutex
+	getSessionMu        sync.Mutex // Global lock to prevent simultaneous session establishment
+	sessions            []*yamux.Session
+	wg                  sync.WaitGroup
 )
 
 type Config struct {
-	Server               string   `yaml:"server"`
-	PublicKey            string   `yaml:"public-key"`
-	ShortId              string   `yaml:"short-id"`
-	SNI                  string   `yaml:"sni"`
-	ListenAddr           string   `yaml:"listen"`
-	UDPEnabled           bool     `yaml:"udp"`
-	CloseOnRotate        bool     `yaml:"close-on-rotate"`
-	Shaper               bool     `yaml:"shaper"`
-	PhasesFile           string   `yaml:"phases-file"`
-	PhasesData           []byte   `yaml:"-"` // For embedded data
-	DecoyData            []byte   `yaml:"-"` // For embedded data
-	ConnectionsTimeOut   int      `yaml:"connections-time-out"`
-	SessionsNum          int      `yaml:"sessions-num"`
-	DecoyTraffic         bool     `yaml:"decoy-traffic"`
-	Bypass               []string `yaml:"bypass"`
-	DNSListen            string   `yaml:"dns-listen"`
-	DNSUpstream          string   `yaml:"dns-upstream"`
-	DNSUpstreamForBypass string   `yaml:"dns-upstream-for-bypass"`
+	Server             string   `yaml:"server"`
+	PublicKey          string   `yaml:"public-key"`
+	ShortId            string   `yaml:"short-id"`
+	SNI                string   `yaml:"sni"`
+	ListenAddr         string   `yaml:"listen"`
+	UDPEnabled         bool     `yaml:"udp"`
+	CloseOnRotate      bool     `yaml:"close-on-rotate"`
+	Shaper             bool     `yaml:"shaper"`
+	PhasesFile         string   `yaml:"phases-file"`
+	PhasesData         []byte   `yaml:"-"` // For embedded data
+	DecoyData          []byte   `yaml:"-"` // For embedded data
+	ConnectionsTimeOut int      `yaml:"connections-time-out"`
+	SessionsNum        int      `yaml:"sessions-num"`
+	DecoyTraffic       bool     `yaml:"decoy-traffic"`
+	Bypass             []string `yaml:"bypass"`
+	DNSListen          string   `yaml:"dns-listen"`
+	DNSUpstream        string   `yaml:"dns-upstream"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -84,18 +83,17 @@ func LoadConfig(path string) (*Config, error) {
 
 func ParseConfig(data []byte) (*Config, error) {
 	cfg := &Config{
-		SNI:                  "github.com",
-		ListenAddr:           "0.0.0.0:1080",
-		UDPEnabled:           true,
-		CloseOnRotate:        false,
-		Shaper:               false,
-		PhasesFile:           "phases.yml",
-		ConnectionsTimeOut:   300,
-		SessionsNum:          5,
-		DecoyTraffic:         false,
-		DNSListen:            "",
-		DNSUpstream:          "8.8.8.8:53",
-		DNSUpstreamForBypass: "",
+		SNI:                "github.com",
+		ListenAddr:         "0.0.0.0:1080",
+		UDPEnabled:         true,
+		CloseOnRotate:      false,
+		Shaper:             false,
+		PhasesFile:         "phases.yml",
+		ConnectionsTimeOut: 300,
+		SessionsNum:        5,
+		DecoyTraffic:       false,
+		DNSListen:          "",
+		DNSUpstream:        "8.8.8.8:53",
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
@@ -115,8 +113,12 @@ func ParseConfig(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
-func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *sync.Map) error {
+func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
 	mrand.Seed(time.Now().UnixNano())
+
+	if _, ok := dnsCache.Load("revert"); !ok {
+		dnsCache.Store("revert", map[string]any{})
+	}
 
 	gUDPEnabled = cfg.UDPEnabled
 	gCloseOnRotate = cfg.CloseOnRotate
@@ -128,7 +130,6 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *sync.
 	copy(gBypass, cfg.Bypass)
 	gDNSListen = cfg.DNSListen
 	gDNSUpstream = cfg.DNSUpstream
-	gDNSUpstreamForBypass = cfg.DNSUpstreamForBypass
 
 	pubKey, err := base64.StdEncoding.DecodeString(cfg.PublicKey)
 	if err != nil || len(pubKey) != 32 {
@@ -151,6 +152,20 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *sync.
 	} else {
 		gBypass = append(gBypass, gServerAddr)
 	}
+
+	// Automatically bypass loopback addresses.
+	// This ensures that local applications (like Mihomo sending DNS queries to 127.0.0.1:53 via SOCKS5)
+	// correctly hit our local DNS server instead of tunneling 127.0.0.1 to the remote VPS.
+	gBypass = append(gBypass,
+		"127.0.0.0/8",
+		"::1/128",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16",
+		"fc00::/7",
+		"fe80::/10",
+	)
 
 	if gSessionsNum < 1 {
 		gSessionsNum = 1
@@ -677,12 +692,16 @@ func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, e
 	}
 	if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("read tunnel response: %w", err)
 	}
 	if respBuf[0] != 0x00 {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
 	}
 
@@ -718,12 +737,16 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 	}
 	if _, err := io.ReadFull(stream, ack[:]); err != nil {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("read UDP ack: %w", err)
 	}
 	if ack[0] != 0x00 {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("server rejected UDP relay")
 	}
 	return &timeoutStream{Conn: stream}, nil
@@ -733,7 +756,7 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 // It opens a yamux UDP relay stream to the server, binds a local UDP socket,
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
-func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *sync.Map) {
+func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.DnsCache) {
 	var (
 		err    error
 		s      *yamux.Session
@@ -855,11 +878,28 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *sync.Map) 
 			}
 
 			// Try DNS cache
-			if originalHost, ok := dnsCache.Load(host); ok {
-				host = originalHost.(string)
+			var domainFromIp string
+			var ipFromDomain string
+			if c, ok := dnsCache.Load(host); ok {
+				domainFromIp = c.(string)
+			} else if m, ok := dnsCache.Load("revert"); ok {
+				if i, ok := m.(map[string]any)[host]; ok {
+					ipFromDomain = i.(string)
+				}
 			}
 
-			if shouldBypass(host) {
+			var isShouldBypass bool
+			if len(domainFromIp) > 0 {
+				isShouldBypass = shouldBypass(domainFromIp)
+			} else {
+				isShouldBypass = shouldBypass(host)
+			}
+
+			if len(ipFromDomain) > 0 {
+				host = ipFromDomain
+			}
+
+			if isShouldBypass {
 				// Bypass! Send directly.
 				targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 				if err == nil {
@@ -930,7 +970,7 @@ func closeWrite(c net.Conn) {
 }
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
-func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *sync.Map) {
+func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
 	defer func() {
 		go conn.Close()
 	}()
@@ -941,10 +981,17 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *sync.Map) {
 		return
 	}
 
-	// Try to resolve IP to hostname from DNS cache for better logging and bypass
-	if originalHost, ok := dnsCache.Load(host); ok {
-		log.Printf("Resolved %s → %s (from DNS cache)", host, originalHost)
-		host = originalHost.(string)
+	// Try DNS cache
+	var domainFromIp string
+	var ipFromDomain string
+	if c, ok := dnsCache.Load(host); ok {
+		domainFromIp = c.(string)
+		log.Printf("Resolved %s → %s (from DNS cache)", host, domainFromIp)
+	} else if m, ok := dnsCache.Load("revert"); ok {
+		if i, ok := m.(map[string]any)[host]; ok {
+			ipFromDomain = i.(string)
+			log.Printf("Resolved %s → %s (from DNS cache)", host, ipFromDomain)
+		}
 	}
 
 	if cmd == 0x03 { // UDP ASSOCIATE
@@ -952,7 +999,18 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *sync.Map) {
 		return
 	}
 
-	if shouldBypass(host) {
+	var isShouldBypass bool
+	if len(domainFromIp) > 0 {
+		isShouldBypass = shouldBypass(domainFromIp)
+	} else {
+		isShouldBypass = shouldBypass(host)
+	}
+
+	if len(ipFromDomain) > 0 {
+		host = ipFromDomain
+	}
+
+	if isShouldBypass {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		handleDirect(ctx, conn, host, port)
 		return

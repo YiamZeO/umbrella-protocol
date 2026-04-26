@@ -53,11 +53,11 @@ func NewTunnelCoreWindow(appRef fyne.App, appSettings *settings.AppSettings, l *
 		appSettings.TunnelCorePath = strings.TrimSpace(pathEntry.Text)
 		appSettings.TunnelCoreArgs = strings.TrimSpace(argsEntry.Text)
 		if err := settings.SaveAppSettings(appSettings, appRef); err != nil {
-			l.AppendLog("[Error] Failed to save tunnel core settings: " + err.Error())
+			l.AppendLog("[ERR] Failed to save tunnel core settings: " + err.Error())
 			dialogs.ShowStyledError(tunnelCoreEditor, "Save Error", err.Error())
 			return
 		}
-		l.AppendLog("[System] Tunnel core settings saved")
+		l.AppendLog("Tunnel core settings saved")
 		appRef.SendNotification(fyne.NewNotification("Saved", "Tunnel core settings saved"))
 		tunnelCoreEditor.Close()
 	})

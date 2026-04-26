@@ -278,12 +278,16 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 	}
 	if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("read vision response: %w", err)
 	}
 	if respBuf[0] != 0x00 {
 		go stream.Close()
-		dropStalledSession(s)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			dropStalledSession(s)
+		}
 		return nil, fmt.Errorf("server rejected vision connection to %s:%d", destHost, destPort)
 	}
 

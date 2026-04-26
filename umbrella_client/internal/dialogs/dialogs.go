@@ -110,10 +110,10 @@ func ShowSavePresetDialog(appRef fyne.App, logsContainer *logging.LogsContainer,
 		if err := appSettings.SavePreset(name, appRef); err != nil {
 			errorLbl.SetText("Failed to save: " + err.Error())
 			errorLbl.Show()
-			logsContainer.AppendLog("[Error] Failed to save preset: " + err.Error())
+			logsContainer.AppendLog("[ERR] Failed to save preset: " + err.Error())
 			return
 		}
-		logsContainer.AppendLog("[System] Saved preset: " + name)
+		logsContainer.AppendLog("Saved preset: " + name)
 		appRef.SendNotification(fyne.NewNotification("Preset Saved", name))
 		dialogWin.Close()
 	})

@@ -199,44 +199,106 @@ func DnsCacheFilePath(appFilesDir string) string {
 	return filepath.Join(appFilesDir, "dns_cache.json")
 }
 
-type dnsCacheFile struct {
-	Data      map[string]string `json:"data"`
-	Timestamp time.Time         `json:"timestamp"`
+type DnsCache struct {
+	mu   sync.RWMutex
+	data map[string]any
 }
 
-func LoadDnsCache(appFilesDir string) (*sync.Map, error) {
+func NewDnsCache() *DnsCache {
+	return &DnsCache{
+		data: make(map[string]any),
+	}
+}
+
+func (d *DnsCache) Load(key string) (any, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	v, ok := d.data[key]
+	return v, ok
+}
+
+func (d *DnsCache) Store(key string, value any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.data[key] = value
+}
+
+func (d *DnsCache) LoadAll() map[string]any {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	result := make(map[string]any, len(d.data))
+	for k, v := range d.data {
+		result[k] = v
+	}
+	return result
+}
+
+func (d *DnsCache) Range(f func(key, value any) bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for k, v := range d.data {
+		if !f(k, v) {
+			return
+		}
+	}
+}
+
+func (d *DnsCache) GetRevertMap() map[string]any {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if revert, ok := d.data["revert"]; ok {
+		if m, ok := revert.(map[string]any); ok {
+			return m
+		}
+	}
+	m := make(map[string]any)
+	d.data["revert"] = m
+	return m
+}
+
+func (d *DnsCache) SetRevertValue(hostname, ip string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	revert, ok := d.data["revert"]
+	if !ok {
+		revert = make(map[string]any)
+		d.data["revert"] = revert
+	}
+	revert.(map[string]any)[hostname] = ip
+}
+
+type dnsCacheFile struct {
+	Data      map[string]any `json:"data"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+func LoadDnsCache(appFilesDir string) (*DnsCache, error) {
 	p := DnsCacheFilePath(appFilesDir)
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return &sync.Map{}, nil
+		return NewDnsCache(), nil
 	}
 	var cf dnsCacheFile
 	if err := json.Unmarshal(b, &cf); err != nil {
-		return &sync.Map{}, err
+		return NewDnsCache(), err
 	}
-	m := &sync.Map{}
+	d := &DnsCache{
+		data: make(map[string]any),
+	}
 	for k, v := range cf.Data {
-		m.Store(k, v)
+		d.data[k] = v
 	}
-	return m, nil
+	return d, nil
 }
 
-func SaveDnsCache(m *sync.Map, appFilesDir string) error {
+func SaveDnsCache(d *DnsCache, appFilesDir string) error {
 	p := DnsCacheFilePath(appFilesDir)
 
 	if appFilesDir != "" {
 		_ = os.MkdirAll(appFilesDir, 0o755)
 	}
 
-	data := make(map[string]string)
-	m.Range(func(k, v interface{}) bool {
-		if key, ok := k.(string); ok {
-			if val, ok := v.(string); ok {
-				data[key] = val
-			}
-		}
-		return true
-	})
+	data := d.LoadAll()
 
 	existing, err := os.ReadFile(p)
 	if err == nil && len(existing) > 0 {

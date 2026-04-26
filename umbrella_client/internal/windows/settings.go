@@ -50,11 +50,11 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 
 		saveBtn := widget.NewButton("Save", func() {
 			if err := storage.SaveConfig([]byte(entry.Text), appSettings.AppFilesDir, appRef); err != nil {
-				l.AppendLog("[Error] Failed to save config.yaml: " + err.Error())
+				l.AppendLog("[ERR] Failed to save config.yaml: " + err.Error())
 				dialogs.ShowStyledError(configWin, "Save Error", err.Error())
 				return
 			}
-			l.AppendLog("[System] Saved config.yaml")
+			l.AppendLog("Saved config.yaml")
 			appRef.SendNotification(fyne.NewNotification("Saved", "config.yaml saved"))
 			if configWin != nil {
 				configWin.Close()
@@ -87,11 +87,11 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 
 		saveBtn := widget.NewButton("Save", func() {
 			if err := storage.SavePhases([]byte(entry.Text), appSettings.AppFilesDir, appRef); err != nil {
-				l.AppendLog("[Error] Failed to save phases.yml: " + err.Error())
+				l.AppendLog("[ERR] Failed to save phases.yml: " + err.Error())
 				dialogs.ShowStyledError(phasesWin, "Save Error", err.Error())
 				return
 			}
-			l.AppendLog("[System] Saved phases.yml")
+			l.AppendLog("Saved phases.yml")
 			appRef.SendNotification(fyne.NewNotification("Saved", "phases.yml saved"))
 			if phasesWin != nil {
 				phasesWin.Close()
