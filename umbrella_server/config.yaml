@@ -1,0 +1,6 @@
+port: "443"
+private-key: "" # generated if empty
+short-id: ""    # generated if empty
+dest: "github.com:443"
+server-names: "" # comma-separated allowed SNIs (default: dest hostname)
+debug: false
