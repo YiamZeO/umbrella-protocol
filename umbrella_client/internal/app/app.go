@@ -301,8 +301,8 @@ func CreateAndRun() {
 
 				objs := []fyne.CanvasObject{}
 				for _, line := range lines {
-					col := ui.ColorToNRGBA(ui.CurrentTheme.Gold)
-					if strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERROR]") {
+					col := ui.ColorToNRGBA(ui.CurrentTheme.Text)
+					if strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERROR]") {
 						col = ui.ColorToNRGBA(ui.CurrentTheme.Love)
 					}
 

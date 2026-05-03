@@ -158,7 +158,7 @@ var (
 		Foam:          lipgloss.Color(moonFoam),
 		Iris:          lipgloss.Color(moonIris),
 		Highlight:     lipgloss.Color(moonHighlight),
-		HighlightHigh: lipgloss.Color(moonGold),
+		HighlightHigh: lipgloss.Color(moonLove),
 	}
 
 	CatppuccinLatte = Theme{

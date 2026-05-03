@@ -239,7 +239,7 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *stora
 			select {
 			case <-ch:
 				return nil
-			case <-time.After(10 * time.Second):
+			case <-time.After(5 * time.Second):
 				return nil
 			}
 		default:
