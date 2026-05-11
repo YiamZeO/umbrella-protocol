@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,10 +20,12 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"github.com/muesli/reflow/wordwrap"
 
-	"umbrella_client"
-	"umbrella_client/internal/client"
+	"umbrella_client/internal/client/config"
+	"umbrella_client/internal/client/decoy"
+	"umbrella_client/internal/client/hysteria"
+	"umbrella_client/internal/client/torrent"
+	"umbrella_client/internal/client/xtls"
 	"umbrella_client/internal/logging"
 	"umbrella_client/internal/settings"
 	"umbrella_client/internal/storage"
@@ -37,7 +38,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	// Set up logging first to capture all output
 	onceLog.Do(func() {
 		log.SetOutput(&logging.LogWriter{LogsContainer: l})
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		log.SetFlags(0)
 	})
 	err := os.MkdirAll(appSettings.AppFilesDir, 0o755)
 	if err != nil {
@@ -56,7 +57,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	}
 
 	l.AppendLog("Parsing configuration...")
-	cfg, err := client.ParseConfig(configData)
+	cfg, err := config.ParseConfig(configData)
 	if err != nil {
 		l.AppendLog("[ERR] Config parse failed: " + err.Error())
 		finish("Status: Config Error", isRunning, l, startEnabled, stopEnabled)
@@ -72,11 +73,6 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	}
 	cfg.PhasesData = phasesData
 
-	// Keep decoy_reqs.json as optional embedded fallback
-	if d, err := umbrella_client.FS.ReadFile("decoy_reqs.json"); err == nil {
-		cfg.DecoyData = d
-	}
-
 	// Log what will be started
 	l.AppendLog(fmt.Sprintf("Starting client on %s", cfg.ListenAddr))
 	if cfg.DNSListen != "" {
@@ -87,6 +83,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	}
 	if cfg.DecoyTraffic {
 		l.AppendLog("Decoy traffic: enabled")
+		go decoy.StartGlobalDecoy(ctx)
 	}
 
 	// Start tunnel core if configured
@@ -103,9 +100,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 	go func() {
 		dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
 		if err != nil {
-			l.AppendLog("[ERR] Failed load dns cache: " + err.Error())
-			finish("Status: Failed load dns cache", isRunning, l, startEnabled, stopEnabled)
-			return
+			l.AppendLog("[ERR] Failed load dns cache. Created new: " + err.Error())
 		}
 
 		defer func() {
@@ -132,7 +127,19 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 		}()
 
 		l.AppendLog("Starting client...")
-		err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
+		var start func(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error
+		switch cfg.Protocol {
+		case "xtls":
+			start = xtls.Start
+		case "hysteria":
+			start = hysteria.Start
+		case "torrent":
+			start = torrent.Start
+		default:
+			l.AppendLog("[ERR] Client failed to start: not valid protocol")
+			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
+		}
+		err = start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 		if err != nil {
 			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
 				if runtime.GOOS != "android" {
@@ -154,9 +161,10 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 							return
 						}
 					}
-					err = client.Start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
+					err = start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
 				}
 			}
+
 			l.AppendLog(fmt.Sprintf("[ERR] Client failed to start: %v", err))
 			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
 		} else {
@@ -262,94 +270,110 @@ func CreateAndRun() {
 		}
 	}
 
-	lg := logging.LogsContainer{
-		LogMu:      sync.Mutex{},
-		LogBind:    binding.NewString(),
-		StatusBind: binding.NewString(),
-	}
+	lg := logging.NewLogsContainer()
 
 	// UI Components
 	statusLabel := widget.NewLabelWithData(lg.StatusBind)
 	statusLabel.Alignment = fyne.TextAlignCenter
 	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	// Create a proper log display area as a scrollable VBox of colored lines
-	logContent := container.NewVBox()
-	logVBox := container.NewVScroll(logContent)
-
-	rebuildMtx := sync.Mutex{}
-
-	var lastColsWhenRebuild int
-
-	// rebuildLogs renders `text` into the logContent using current wrapping and text size
-	rebuildLogs := func(text string) {
-		// Schedule the full rebuild on the Fyne main thread to avoid thread errors
-		fyne.Do(func() {
-			rebuildMtx.Lock()
-			defer rebuildMtx.Unlock()
-			if logVBox != nil {
-				currentWidth := logVBox.Size().Width
-
-				trimmed := strings.TrimRight(text, "\n")
-				lines := []string{}
-				if trimmed != "" {
-					lines = strings.Split(trimmed, "\n")
-				}
-				if len(lines) > 100 {
-					lines = lines[len(lines)-100:]
-				}
-
-				objs := []fyne.CanvasObject{}
-				for _, line := range lines {
-					col := ui.ColorToNRGBA(ui.CurrentTheme.Text)
-					if strings.Contains(line, "[ERR]") || strings.Contains(line, "[ERROR]") {
-						col = ui.ColorToNRGBA(ui.CurrentTheme.Love)
-					}
-
-					// determine an approximate column width based on available pixels
-					cols := 0
-					if currentWidth > 0 {
-						avgChar := float32(logTextSize) * 0.62
-						if avgChar <= 0 {
-							avgChar = 7.0
-						}
-						cols = int(math.Max(20, float64(currentWidth/avgChar)))
-					}
-
-					if cols <= 0 {
-						if lastColsWhenRebuild > 0 {
-							cols = lastColsWhenRebuild
-						} else {
-							cols = 120
-						}
-					} else {
-						lastColsWhenRebuild = cols
-					}
-
-					wrapped := wordwrap.String(line, cols)
-					sub := strings.Split(wrapped, "\n")
-					for _, s := range sub {
-						t := canvas.NewText(s, col)
-						t.TextSize = logTextSize
-						t.TextStyle.Monospace = true
-						t.Alignment = fyne.TextAlignLeading
-						objs = append(objs, t)
-					}
-				}
-
-				logContent.Objects = objs
-				logContent.Refresh()
-				logVBox.ScrollToBottom()
+	// Создаем виртуализированный список
+	logList := widget.NewList(
+		func() int {
+			lg.LogMu.RLock()
+			defer lg.LogMu.RUnlock()
+			return len(lg.Logs)
+		},
+		func() fyne.CanvasObject {
+			t := canvas.NewText("", ui.ColorToNRGBA(ui.CurrentTheme.Text))
+			t.TextSize = logTextSize
+			t.TextStyle.Monospace = true
+			return t
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			lg.LogMu.RLock()
+			defer lg.LogMu.RUnlock()
+			if id >= len(lg.Logs) {
+				return
 			}
-		})
+			msg := lg.Logs[id]
+			t := item.(*canvas.Text)
+			t.Text = msg
+			if strings.Contains(msg, "[ERR]") || strings.Contains(msg, "[ERROR]") {
+				t.Color = ui.ColorToNRGBA(ui.CurrentTheme.Love)
+			} else {
+				t.Color = ui.ColorToNRGBA(ui.CurrentTheme.Text)
+			}
+			t.TextSize = logTextSize
+			t.Refresh()
+		},
+	)
+
+	logList.OnSelected = func(id widget.ListItemID) {
+		lg.LogMu.RLock()
+		if id < len(lg.Logs) {
+			msg := lg.Logs[id]
+			window.Clipboard().SetContent(msg)
+			myApp.SendNotification(fyne.NewNotification("Copied", "Log line copied to clipboard"))
+		}
+		lg.LogMu.RUnlock()
+		logList.Unselect(id)
 	}
 
-	// Connect the log binding to update the display (rebuilds line items)
-	lg.LogBind.AddListener(binding.NewDataListener(func() {
-		if text, err := lg.LogBind.Get(); err == nil {
-			rebuildLogs(text)
+	copyBtn := widget.NewButtonWithIcon("Copy All", theme.ContentCopyIcon(), func() {
+		lg.LogMu.RLock()
+		val := strings.Join(lg.Logs, "\n")
+		lg.LogMu.RUnlock()
+		window.Clipboard().SetContent(val)
+		myApp.SendNotification(fyne.NewNotification("Copied", "All logs copied"))
+	})
+
+	clearBtn := widget.NewButtonWithIcon("Clear", theme.DeleteIcon(), func() {
+		lg.LogMu.Lock()
+		lg.Logs = []string{}
+		lg.LogMu.Unlock()
+		fyne.Do(func() { logList.Refresh() })
+	})
+
+	// Font size controls for logs
+	decBtn := widget.NewButtonWithIcon("A-", theme.ContentRemoveIcon(), func() {
+		if logTextSize > 6 {
+			logTextSize -= 1
+			fyne.Do(func() { logList.Refresh() })
+			// persist change
+			appSettings.LogsFontSize = logTextSize
+			go settings.SaveAppSettings(appSettings, myApp)
 		}
-	}))
+	})
+	incBtn := widget.NewButtonWithIcon("A+", theme.ContentAddIcon(), func() {
+		if logTextSize < 48 {
+			logTextSize += 1
+			fyne.Do(func() { logList.Refresh() })
+			// persist change
+			appSettings.LogsFontSize = logTextSize
+			go settings.SaveAppSettings(appSettings, myApp)
+		}
+	})
+
+	// Пакетное обновление UI раз в секунду
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var lastUpdateCount uint64
+		for range ticker.C {
+			lg.LogMu.RLock()
+			currentUpdateCount := lg.UpdateCount
+			lg.LogMu.RUnlock()
+
+			if currentUpdateCount != lastUpdateCount {
+				lastUpdateCount = currentUpdateCount
+
+				fyne.Do(func() { logList.Refresh() })
+				fyne.Do(func() { logList.ScrollToBottom() })
+
+			}
+		}
+	}()
 
 	startBtn := widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), nil)
 	stopBtn := widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), nil)
@@ -407,7 +431,7 @@ func CreateAndRun() {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelFunc = cancel
 		var onceLog sync.Once
-		go initAndStart(appSettings, &lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog)
+		go initAndStart(appSettings, lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog)
 		if appSettings.Timer > 0 {
 			go func() {
 				var (
@@ -446,45 +470,12 @@ func CreateAndRun() {
 
 	stopBtn.OnTapped = stopFunc
 
-	copyBtn := widget.NewButtonWithIcon("Copy All", theme.ContentCopyIcon(), func() {
-		val, _ := lg.LogBind.Get()
-		window.Clipboard().SetContent(val)
-		myApp.SendNotification(fyne.NewNotification("Copied", "All logs copied"))
-	})
-
-	clearBtn := widget.NewButtonWithIcon("Clear", theme.DeleteIcon(), func() {
-		lg.LogMu.Lock()
-		lg.AllLogs = ""
-		lg.LogMu.Unlock()
-		rebuildLogs("")
-	})
-
-	// Font size controls for logs
-	decBtn := widget.NewButtonWithIcon("A-", theme.ContentRemoveIcon(), func() {
-		if logTextSize > 6 {
-			logTextSize -= 1
-			rebuildLogs(lg.AllLogs)
-			// persist change
-			appSettings.LogsFontSize = logTextSize
-			go settings.SaveAppSettings(appSettings, myApp)
-		}
-	})
-	incBtn := widget.NewButtonWithIcon("A+", theme.ContentAddIcon(), func() {
-		if logTextSize < 48 {
-			logTextSize += 1
-			rebuildLogs(lg.AllLogs)
-			// persist change
-			appSettings.LogsFontSize = logTextSize
-			go settings.SaveAppSettings(appSettings, myApp)
-		}
-	})
-
 	var presetsWin fyne.Window
 	presetsBtn := widget.NewButtonWithIcon("Presets", theme.FileIcon(), func() {
 		if presetsWin != nil {
 			presetsWin.Close()
 		}
-		presetsWin = windows.NewPresetsWindow(myApp, appSettings, &lg)
+		presetsWin = windows.NewPresetsWindow(myApp, appSettings, lg)
 		presetsWin.Show()
 	})
 
@@ -493,7 +484,7 @@ func CreateAndRun() {
 		if settingsWin != nil {
 			settingsWin.Close()
 		}
-		settingsWin = windows.NewSettingsWindow(myApp, appSettings, &lg)
+		settingsWin = windows.NewSettingsWindow(myApp, appSettings, lg)
 		settingsWin.Show()
 	})
 
@@ -504,36 +495,11 @@ func CreateAndRun() {
 	)
 	bottom := container.NewGridWithColumns(4, copyBtn, clearBtn, decBtn, incBtn)
 
-	window.SetContent(container.NewBorder(top, bottom, nil, nil, logVBox))
+	window.SetContent(container.NewBorder(top, bottom, nil, nil, logList))
 	// Restore window size from settings if present
 	if appSettings.WindowWidth > 0 && appSettings.WindowHeight > 0 {
 		window.Resize(fyne.NewSize(appSettings.WindowWidth, appSettings.WindowHeight))
 	}
-
-	// Watch for width changes and rewrap logs when needed
-	var lastLogWidth float32
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if logVBox == nil {
-				continue
-			}
-			w := logVBox.Size().Width
-			if w <= 0 {
-				continue
-			}
-			if math.Abs(float64(w-lastLogWidth)) > 1.0 {
-				lastLogWidth = w
-				if rebuildMtx.TryLock() {
-					// trigger rebuild with new wrapping
-					rebuildLogs(lg.AllLogs)
-					rebuildMtx.Unlock()
-				}
-
-			}
-		}
-	}()
 
 	lg.StatusBind.Set("Status: Ready")
 	startEnabled.Set(true)

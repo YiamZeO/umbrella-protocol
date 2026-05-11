@@ -1,4 +1,4 @@
-package client
+package xtls
 
 import (
 	"context"
@@ -17,20 +17,19 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"net"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
+	"github.com/miekg/dns"
 	utls "github.com/refraction-networking/utls"
-	"gopkg.in/yaml.v3"
 
+	"umbrella_client/internal/client/config"
+	"umbrella_client/internal/client/shaper"
+	"umbrella_client/internal/client/share"
+	"umbrella_client/internal/client/umbrella_dns"
 	"umbrella_client/internal/storage"
 )
-
-// copyBufPool holds reusable 32 KiB buffers for bidirectional TCP proxying.
-var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
 
 // Global session state — all SOCKS5 connections share one TLS connection.
 var (
@@ -39,11 +38,9 @@ var (
 	gServerPubKey       []byte
 	gShortId            [8]byte
 	gUDPEnabled         bool
-	gCloseOnRotate      bool
 	gShaper             bool
 	gConnectionsTimeOut time.Duration
 	gSessionsNum        int
-	gDecoyTraffic       bool
 	gBypass             []string
 	gDNSListen          string
 	gDNSUpstream        string
@@ -53,90 +50,24 @@ var (
 	wg                  sync.WaitGroup
 )
 
-type Config struct {
-	Server             string   `yaml:"server"`
-	PublicKey          string   `yaml:"public-key"`
-	ShortId            string   `yaml:"short-id"`
-	SNI                string   `yaml:"sni"`
-	ListenAddr         string   `yaml:"listen"`
-	UDPEnabled         bool     `yaml:"udp"`
-	CloseOnRotate      bool     `yaml:"close-on-rotate"`
-	Shaper             bool     `yaml:"shaper"`
-	PhasesFile         string   `yaml:"phases-file"`
-	PhasesData         []byte   `yaml:"-"` // For embedded data
-	DecoyData          []byte   `yaml:"-"` // For embedded data
-	ConnectionsTimeOut int      `yaml:"connections-time-out"`
-	SessionsNum        int      `yaml:"sessions-num"`
-	DecoyTraffic       bool     `yaml:"decoy-traffic"`
-	Bypass             []string `yaml:"bypass"`
-	DNSListen          string   `yaml:"dns-listen"`
-	DNSUpstream        string   `yaml:"dns-upstream"`
-}
-
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return ParseConfig(data)
-}
-
-func ParseConfig(data []byte) (*Config, error) {
-	cfg := &Config{
-		SNI:                "github.com",
-		ListenAddr:         "0.0.0.0:1080",
-		UDPEnabled:         true,
-		CloseOnRotate:      false,
-		Shaper:             false,
-		PhasesFile:         "phases.yml",
-		ConnectionsTimeOut: 300,
-		SessionsNum:        5,
-		DecoyTraffic:       false,
-		DNSListen:          "",
-		DNSUpstream:        "8.8.8.8:53",
-	}
-
-	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, err
-	}
-
-	if cfg.Server == "" {
-		return nil, fmt.Errorf("server is required in config")
-	}
-	if cfg.PublicKey == "" {
-		return nil, fmt.Errorf("public-key is required in config")
-	}
-	if cfg.ShortId == "" {
-		return nil, fmt.Errorf("short-id is required in config")
-	}
-
-	return cfg, nil
-}
-
-func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
+func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
 	mrand.Seed(time.Now().UnixNano())
 
-	if _, ok := dnsCache.Load("revert"); !ok {
-		dnsCache.Store("revert", map[string]any{})
-	}
-
 	gUDPEnabled = cfg.UDPEnabled
-	gCloseOnRotate = cfg.CloseOnRotate
 	gShaper = cfg.Shaper
-	gConnectionsTimeOut = time.Duration(cfg.ConnectionsTimeOut) * time.Second
-	gSessionsNum = cfg.SessionsNum
-	gDecoyTraffic = cfg.DecoyTraffic
+	gConnectionsTimeOut = time.Duration(cfg.Xtls.ConnectionsTimeOut) * time.Second
+	gSessionsNum = cfg.Xtls.SessionsNum
 	gBypass = make([]string, len(cfg.Bypass))
 	copy(gBypass, cfg.Bypass)
 	gDNSListen = cfg.DNSListen
 	gDNSUpstream = cfg.DNSUpstream
 
-	pubKey, err := base64.StdEncoding.DecodeString(cfg.PublicKey)
+	pubKey, err := base64.StdEncoding.DecodeString(cfg.Xtls.PublicKey)
 	if err != nil || len(pubKey) != 32 {
 		return fmt.Errorf("invalid public-key in config: must be base64 of exactly 32 bytes")
 	}
 
-	shortIdBytes, err := hex.DecodeString(cfg.ShortId)
+	shortIdBytes, err := hex.DecodeString(cfg.Xtls.ShortId)
 	if err != nil || len(shortIdBytes) > 8 {
 		return fmt.Errorf("invalid short-id in config: must be up to 16 hex chars")
 	}
@@ -175,40 +106,34 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *stora
 
 	if gShaper {
 		if cfg.PhasesData != nil {
-			if err := ParsePhases(cfg.PhasesData); err != nil {
+			if err := shaper.ParsePhases(cfg.PhasesData); err != nil {
 				return fmt.Errorf("failed to parse embedded phases: %v", err)
 			}
-			log.Printf("Loaded %d phases from embedded data", len(Phases))
+			log.Printf("[INFO] Loaded %d phases from embedded data", len(shaper.Phases))
 		} else {
-			if err := loadPhases(cfg.PhasesFile); err != nil {
+			if err := shaper.LoadPhases(cfg.PhasesFile); err != nil {
 				return fmt.Errorf("failed to load phases from %s: %v", cfg.PhasesFile, err)
 			}
-			log.Printf("Loaded %d phases from %s", len(Phases), cfg.PhasesFile)
+			log.Printf("[INFO] Loaded %d phases from %s", len(shaper.Phases), cfg.PhasesFile)
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runShaperEngine(ctx)
+			shaper.RunShaperEngine(ctx)
 		}()
-	}
-
-	if cfg.DecoyTraffic && cfg.DecoyData != nil {
-		if err := ParseDecoyURLs(cfg.DecoyData); err != nil {
-			log.Printf("[ERR] Decoy: failed to parse embedded URLs: %v", err)
-		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
-	log.Printf("Umbrella/REALITY client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
+	log.Printf("[INFO] Umbrella/Reality client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
 
 	if gDNSListen != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runDNSServer(ctx, dnsCache)
+			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
 		}()
 	}
 
@@ -230,7 +155,7 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *stora
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Umbrella/REALITY client listener closed, stopping")
+			log.Printf("[INFO] Umbrella/Reality client listener closed, stopping")
 			ch := make(chan bool)
 			go func() {
 				wg.Wait()
@@ -273,84 +198,91 @@ func Start(cfg *Config, ctx context.Context, appFilesDir string, dnsCache *stora
 	}
 }
 
-// shouldBypass returns true if the host should be connected to directly.
-// Supports domains (including all subdomains) and IP CIDR ranges (e.g. "192.168.1.0/24").
-func shouldBypass(host string) bool {
-	if len(gBypass) == 0 {
-		return false
-	}
-
-	host = strings.ToLower(host)
-	hostIP := net.ParseIP(host)
-
-	for _, rule := range gBypass {
-		rule = strings.ToLower(rule)
-		if rule == "" {
-			continue
-		}
-
-		// 1. Try as CIDR (e.g. "192.168.1.0/24")
-		if hostIP != nil {
-			if _, ipnet, err := net.ParseCIDR(rule); err == nil {
-				if ipnet.Contains(hostIP) {
-					return true
-				}
-				continue
-			}
-		}
-
-		// 2. Exact match (works for both IPs and domains)
-		if host == rule {
-			return true
-		}
-
-		// 3. Domain suffix match (only if host is not an IP)
-		if hostIP == nil && strings.HasSuffix(host, "."+rule) {
-			return true
-		}
-	}
-	return false
-}
-
-// handleDirect connects to the destination directly without tunneling.
-func handleDirect(ctx context.Context, conn net.Conn, host string, port uint16) {
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	remote, err := net.DialTimeout("tcp", target, 30*time.Second)
+// forwardDNS sends a DNS query to the upstream server via the Umbrella tunnel.
+func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
+	s, err := getSession(ctx)
 	if err != nil {
-		log.Printf("[ERR] Direct dial %s error: %v", target, err)
-		return
+		return nil, fmt.Errorf("get session: %w", err)
 	}
-	defer func() {
-		go remote.Close()
-	}()
 
-	log.Printf("Direct connection %s → %s", conn.RemoteAddr(), target)
-
-	done := make(chan struct{}, 2)
-	go func() {
-		b := copyBufPool.Get().(*[]byte)
-		io.CopyBuffer(remote, conn, *b)
-		copyBufPool.Put(b)
-		closeWrite(remote)
-		done <- struct{}{}
-	}()
-	go func() {
-		b := copyBufPool.Get().(*[]byte)
-		io.CopyBuffer(conn, remote, *b)
-		copyBufPool.Put(b)
-		closeWrite(conn)
-		done <- struct{}{}
-	}()
-	select {
-	case <-done:
-		<-done
-	case <-ctx.Done():
+	stream, err := openUDPStream(s)
+	if err != nil {
+		return nil, fmt.Errorf("open UDP stream: %w", err)
 	}
+	defer stream.Close()
+
+	// Prepare length-prefixed UDP frame for our relay protocol:
+	// [4B len][ATYP+ADDR+PORT+DATA]
+	dnsData, err := r.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns: %w", err)
+	}
+
+	host, portStr, _ := net.SplitHostPort(gDNSUpstream)
+	var port uint16
+	fmt.Sscanf(portStr, "%d", &port)
+
+	// Build relay header: [ATYP][ADDR][PORT]
+	var addrBytes []byte
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			addrBytes = append([]byte{0x01}, ip4...)
+		} else {
+			addrBytes = append([]byte{0x04}, ip.To16()...)
+		}
+	} else {
+		addrBytes = append([]byte{0x03, byte(len(host))}, []byte(host)...)
+	}
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], port)
+
+	payload := append(addrBytes, portBytes[:]...)
+	payload = append(payload, dnsData...)
+
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
+
+	if _, err := stream.Write(lenBuf); err != nil {
+		return nil, err
+	}
+	if _, err := stream.Write(payload); err != nil {
+		return nil, err
+	}
+
+	// Read response
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		return nil, err
+	}
+	respLen := binary.BigEndian.Uint32(lenBuf)
+	respPayload := make([]byte, respLen)
+	if _, err := io.ReadFull(stream, respPayload); err != nil {
+		return nil, err
+	}
+
+	// Skip ATYP+ADDR+PORT in response (server returns them)
+	// Response from server is [ATYP][ADDR][PORT][DATA]
+	off := 0
+	switch respPayload[0] {
+	case 0x01:
+		off = 1 + 4 + 2
+	case 0x04:
+		off = 1 + 16 + 2
+	case 0x03:
+		off = 1 + 1 + int(respPayload[1]) + 2
+	}
+
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respPayload[off:]); err != nil {
+		return nil, fmt.Errorf("unpack dns resp: %w", err)
+	}
+
+	return respMsg, nil
 }
 
 // getSession returns a multiplexed session from the pool, creating one if needed.
 // All SOCKS5 connections share a pool of TLS connections via yamux streams.
-// The TLS handshake uses the REALITY protocol: authentication is embedded into
+// The TLS handshake uses the Reality protocol: authentication is embedded into
 // the ClientHello via ECDH + AES-GCM-encrypted SessionID, making the connection
 // indistinguishable from a real TLS handshake to a legitimate site.
 func getSession(ctx context.Context) (*yamux.Session, error) {
@@ -515,13 +447,10 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	uConn.SetDeadline(time.Time{}) // clear deadline
 
 	muxCfg := yamux.DefaultConfig()
-	muxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
-	// Telegram relies on long-lived idle connections for push events.
+	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
-	muxCfg.KeepAliveInterval = 10 * time.Second
 	muxCfg.StreamCloseTimeout = 10 * time.Second
-	muxCfg.ConnectionWriteTimeout = 5 * time.Minute
-	muxCfg.LogOutput = log.Writer()
+	muxCfg.LogOutput = io.Discard
 	sess, err := yamux.Client(uConn, muxCfg)
 	if err != nil {
 		uConn.Close()
@@ -534,14 +463,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		scheduleReconnect(ctx, sess)
 	}()
 	sessions[idx] = sess
-	if gDecoyTraffic {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runDecoyTraffic(ctx, sess)
-		}()
-	}
-	log.Printf("REALITY session established to %s (slot %d)", gServerAddr, idx)
+	log.Printf("[INFO] Reality session established to %s (slot %d)", gServerAddr, idx)
 	return sess, nil
 }
 
@@ -568,12 +490,10 @@ func scheduleReconnect(ctx context.Context, s *yamux.Session) {
 		sessMu[i].Lock()
 		if sessions[i] == s {
 			sessions[i] = nil
-			if gCloseOnRotate {
-				log.Printf("Session %p rotated after %s — closing active connections", s, delay.Round(time.Second))
-				go s.Close()
-			} else {
-				log.Printf("Session %p rotated after %s — next request will reconnect", s, delay.Round(time.Second))
-			}
+			go func() {
+				time.Sleep(5 * time.Minute)
+				s.Close()
+			}()
 			sessMu[i].Unlock()
 			break
 		}
@@ -596,11 +516,11 @@ func dropStalledSession(s *yamux.Session) {
 	}
 }
 
-type timeoutStream struct {
+type timeoutConn struct {
 	net.Conn
 }
 
-func (ts *timeoutStream) CloseWrite() error {
+func (ts *timeoutConn) CloseWrite() error {
 	type halfCloser interface{ CloseWrite() error }
 	if hc, ok := ts.Conn.(halfCloser); ok {
 		return hc.CloseWrite()
@@ -608,31 +528,19 @@ func (ts *timeoutStream) CloseWrite() error {
 	return nil
 }
 
-func (ts *timeoutStream) Read(p []byte) (n int, err error) {
+func (ts *timeoutConn) Read(p []byte) (n int, err error) {
 	if gConnectionsTimeOut > 0 {
 		ts.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
 	}
 	n, err = ts.Conn.Read(p)
-	if err != nil && gConnectionsTimeOut > 0 {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			go ts.Conn.Close()
-			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
-		}
-	}
 	return
 }
 
-func (ts *timeoutStream) Write(p []byte) (n int, err error) {
+func (ts *timeoutConn) Write(p []byte) (n int, err error) {
 	if gConnectionsTimeOut > 0 {
 		ts.Conn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
 	}
 	n, err = ts.Conn.Write(p)
-	if err != nil && gConnectionsTimeOut > 0 {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			go ts.Conn.Close()
-			log.Printf("Stream idle for > %v, dropping", gConnectionsTimeOut)
-		}
-	}
 	return
 }
 
@@ -705,7 +613,7 @@ func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, e
 		return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
 	}
 
-	return &timeoutStream{Conn: stream}, nil
+	return &timeoutConn{Conn: stream}, nil
 }
 
 // openUDPStream opens a yamux stream for UDP relay and returns it after server ACK.
@@ -749,7 +657,27 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 		}
 		return nil, fmt.Errorf("server rejected UDP relay")
 	}
-	return &timeoutStream{Conn: stream}, nil
+	return &timeoutConn{Conn: stream}, nil
+}
+
+type timeoutPacketConn struct {
+	net.PacketConn
+}
+
+func (ts *timeoutPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.PacketConn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	n, addr, err = ts.PacketConn.ReadFrom(p)
+	return
+}
+
+func (ts *timeoutPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.PacketConn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	n, err = ts.PacketConn.WriteTo(p, addr)
+	return
 }
 
 // handleSocks5UDP handles a SOCKS5 UDP ASSOCIATE request.
@@ -787,13 +715,19 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 		go stream.Close()
 	}()
 
-	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	rawUdpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		log.Printf("[ERR] UDP ASSOCIATE listen error: %v", err)
 		return
 	}
+
+	udpConn := &timeoutPacketConn{PacketConn: rawUdpConn}
 	defer func() { go udpConn.Close() }()
+
+	// Жизненный цикл UDP релея
+	udpCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	udpAddr := udpConn.LocalAddr().(*net.UDPAddr)
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(udpAddr.Port >> 8), byte(udpAddr.Port)}
@@ -801,7 +735,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 		return
 	}
 
-	log.Printf("UDP relay active, local UDP: %s", udpAddr)
+	log.Printf("[INFO] UDP relay active, local UDP: %s", udpAddr)
 
 	var addrMu sync.Mutex
 	var appAddr net.Addr
@@ -809,26 +743,30 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 	var relayWriter io.Writer = stream
 	var relayReader io.Reader = stream
 	if gShaper {
-		relayWriter = &shapedWriter{w: stream, bucket: &gUpBucket}
-		relayReader = &shapedReader{r: stream, bucket: &gDownBucket}
+		relayWriter = &shaper.ShapedWriter{W: stream, Bucket: &shaper.GUpBucket}
+		relayReader = &shaper.ShapedReader{R: stream, Bucket: &shaper.GDownBucket}
 	}
 
 	// App → Server (Dynamic routing)
 	go func() {
-		buf := make([]byte, 65535)
-		frameBuf := make([]byte, 4+65535)
+		defer cancel()
+		bufPtr := share.UDPBufPool.Get().(*[]byte)
+		defer share.UDPBufPool.Put(bufPtr)
+		buf := *bufPtr
+
+		frameBufPtr := share.UDPBufPool.Get().(*[]byte)
+		defer share.UDPBufPool.Put(frameBufPtr)
+		frameBuf := *frameBufPtr
+
 		for {
 			select {
 			case <-ctx.Done():
+			case <-udpCtx.Done():
 				return
 			default:
 			}
-			udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, addr, err := udpConn.ReadFrom(buf)
 			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
 				return
 			}
 
@@ -879,24 +817,16 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 
 			// Try DNS cache
 			var domainFromIp string
-			var ipFromDomain string
 			if c, ok := dnsCache.Load(host); ok {
 				domainFromIp = c.(string)
-			} else if m, ok := dnsCache.Load("revert"); ok {
-				if i, ok := m.(map[string]any)[host]; ok {
-					ipFromDomain = i.(string)
-				}
+				log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
 			}
 
 			var isShouldBypass bool
 			if len(domainFromIp) > 0 {
-				isShouldBypass = shouldBypass(domainFromIp)
+				isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
 			} else {
-				isShouldBypass = shouldBypass(host)
-			}
-
-			if len(ipFromDomain) > 0 {
-				host = ipFromDomain
+				isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
 			}
 
 			if isShouldBypass {
@@ -912,7 +842,6 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 			payload := buf[3:n] // ATYP + ADDR + PORT + DATA
 			binary.BigEndian.PutUint32(frameBuf[:4], uint32(len(payload)))
 			copy(frameBuf[4:], payload)
-			stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := relayWriter.Write(frameBuf[:4+len(payload)]); err != nil {
 				return
 			}
@@ -921,30 +850,27 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 
 	// Server → App (Tunnel responses)
 	go func() {
+		defer cancel()
 		lenBuf := make([]byte, 4)
-		pktBuf := make([]byte, 3+65535)
+		pktBufPtr := share.UDPBufPool.Get().(*[]byte)
+		defer share.UDPBufPool.Put(pktBufPtr)
+		pktBuf := *pktBufPtr
 		for {
 			select {
 			case <-ctx.Done():
+			case <-udpCtx.Done():
 				return
 			default:
 			}
-			stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 			if _, err := io.ReadFull(relayReader, lenBuf); err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				go udpConn.Close()
 				return
 			}
 			payloadLen := binary.BigEndian.Uint32(lenBuf)
 			if payloadLen > 65535 {
-				go udpConn.Close()
 				return
 			}
 			payload := pktBuf[3 : 3+payloadLen]
 			if _, err := io.ReadFull(relayReader, payload); err != nil {
-				go udpConn.Close()
 				return
 			}
 			addrMu.Lock()
@@ -957,25 +883,19 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 		}
 	}()
 
-	io.Copy(io.Discard, tcpConn)
-}
-
-// closeWrite signals the write-half of a connection is done, allowing the remote
-// to flush any remaining data before the connection is fully torn down.
-func closeWrite(c net.Conn) {
-	type halfCloser interface{ CloseWrite() error }
-	if hc, ok := c.(halfCloser); ok {
-		hc.CloseWrite()
-	}
+	// Ждем закрытия контекста или TCP соединения
+	<-udpCtx.Done()
 }
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
 func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
+	conn = &timeoutConn{Conn: conn}
+
 	defer func() {
 		go conn.Close()
 	}()
 
-	cmd, host, port, err := socks5Handshake(conn)
+	cmd, host, port, err := share.Socks5Handshake(conn, gUDPEnabled)
 	if err != nil {
 		log.Printf("[ERR] SOCKS5 handshake error from %s: %v", conn.RemoteAddr(), err)
 		return
@@ -983,15 +903,9 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 
 	// Try DNS cache
 	var domainFromIp string
-	var ipFromDomain string
 	if c, ok := dnsCache.Load(host); ok {
 		domainFromIp = c.(string)
-		log.Printf("Resolved %s → %s (from DNS cache)", host, domainFromIp)
-	} else if m, ok := dnsCache.Load("revert"); ok {
-		if i, ok := m.(map[string]any)[host]; ok {
-			ipFromDomain = i.(string)
-			log.Printf("Resolved %s → %s (from DNS cache)", host, ipFromDomain)
-		}
+		log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
 	}
 
 	if cmd == 0x03 { // UDP ASSOCIATE
@@ -1001,18 +915,14 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 
 	var isShouldBypass bool
 	if len(domainFromIp) > 0 {
-		isShouldBypass = shouldBypass(domainFromIp)
+		isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
 	} else {
-		isShouldBypass = shouldBypass(host)
-	}
-
-	if len(ipFromDomain) > 0 {
-		host = ipFromDomain
+		isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
 	}
 
 	if isShouldBypass {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		handleDirect(ctx, conn, host, port)
+		share.HandleDirect(ctx, conn, host, port)
 		return
 	}
 
@@ -1030,6 +940,8 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	// Use Vision framing if it looks like a TLS handshake (0x16).
 	useVision := firstByte == 0x16
 
+	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
 	var (
 		stream net.Conn
 		s      *yamux.Session
@@ -1037,7 +949,7 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	for range 3 {
 		s, err = getSession(ctx)
 		if err != nil {
-			log.Printf("[ERR] getSession error for %s:%d: %v", host, port, err)
+			log.Printf("[ERR] getSession error for %s → %v", target, err)
 			return
 		}
 		if useVision {
@@ -1046,7 +958,7 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 			stream, err = openStream(s, host, port)
 		}
 		if err != nil {
-			log.Printf("[ERR] Stream open error for %s:%d (vision=%v): %v", host, port, useVision, err)
+			log.Printf("[ERR] Stream open error for %s (vision=%v) → %v", target, useVision, err)
 		} else {
 			break
 		}
@@ -1060,116 +972,38 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		go stream.Close()
 	}()
 
-	log.Printf("Tunneling %s → %s:%d (vision=%v)", conn.RemoteAddr(), host, port, useVision)
+	log.Printf("[INFO] Tunneling %s → %s (vision=%v)", conn.RemoteAddr(), target, useVision)
 
-	done := make(chan struct{}, 2)
+	sCtx, sCancel := context.WithCancel(ctx)
+	defer sCancel()
 
+	// Relay data with half-close support
 	go func() {
-		b := copyBufPool.Get().(*[]byte)
+		b := share.CopyBufPool.Get().(*[]byte)
+		defer share.CopyBufPool.Put(b)
 		var dst io.Writer = stream
 		if gShaper {
-			dst = &shapedWriter{w: stream, bucket: &gUpBucket}
+			dst = &shaper.ShapedWriter{W: stream, Bucket: &shaper.GUpBucket}
 		}
 		io.CopyBuffer(dst, pc, *b)
-		copyBufPool.Put(b)
-		closeWrite(stream)
-		done <- struct{}{}
+		share.CloseWrite(stream)
 	}()
+
 	go func() {
-		b := copyBufPool.Get().(*[]byte)
+		defer sCancel()
+		b := share.CopyBufPool.Get().(*[]byte)
+		defer share.CopyBufPool.Put(b)
 		var src io.Reader = stream
 		if gShaper {
-			src = &shapedReader{r: stream, bucket: &gDownBucket}
+			src = &shaper.ShapedReader{R: stream, Bucket: &shaper.GDownBucket}
 		}
 		io.CopyBuffer(pc, src, *b)
-		copyBufPool.Put(b)
-		closeWrite(pc)
-		done <- struct{}{}
 	}()
 
 	select {
-	case <-done:
-		<-done
+	case <-sCtx.Done():
 	case <-ctx.Done():
 	}
-}
-
-// socks5Handshake performs the SOCKS5 greeting + request exchange.
-// Returns the command byte (0x01 CONNECT or 0x03 UDP ASSOCIATE) and
-// destination host/port (populated for CONNECT; addr hint for UDP ASSOCIATE).
-func socks5Handshake(conn net.Conn) (cmd byte, host string, port uint16, err error) {
-	// --- Greeting ---
-	header := make([]byte, 2)
-	if _, err = io.ReadFull(conn, header); err != nil {
-		return 0, "", 0, fmt.Errorf("read greeting: %w", err)
-	}
-	if header[0] != 0x05 {
-		return 0, "", 0, fmt.Errorf("expected SOCKS5, got version %d", header[0])
-	}
-	methods := make([]byte, header[1])
-	if _, err = io.ReadFull(conn, methods); err != nil {
-		return 0, "", 0, fmt.Errorf("read methods: %w", err)
-	}
-	// Select no-auth
-	if _, err = conn.Write([]byte{0x05, 0x00}); err != nil {
-		return 0, "", 0, fmt.Errorf("write method selection: %w", err)
-	}
-
-	// --- Request ---
-	req := make([]byte, 4)
-	if _, err = io.ReadFull(conn, req); err != nil {
-		return 0, "", 0, fmt.Errorf("read request: %w", err)
-	}
-	if req[0] != 0x05 {
-		return 0, "", 0, fmt.Errorf("invalid request version: %d", req[0])
-	}
-	cmd = req[1]
-	switch cmd {
-	case 0x01: // CONNECT — TCP
-	case 0x03: // UDP ASSOCIATE
-		if !gUDPEnabled {
-			conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-			return 0, "", 0, fmt.Errorf("UDP ASSOCIATE disabled (--udp=false)")
-		}
-	default:
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return 0, "", 0, fmt.Errorf("unsupported SOCKS5 command: 0x%02x", cmd)
-	}
-
-	switch req[3] {
-	case 0x01: // IPv4
-		ip := make([]byte, 4)
-		if _, err = io.ReadFull(conn, ip); err != nil {
-			return 0, "", 0, fmt.Errorf("read IPv4: %w", err)
-		}
-		host = net.IP(ip).String()
-	case 0x03: // domain
-		lenBuf := make([]byte, 1)
-		if _, err = io.ReadFull(conn, lenBuf); err != nil {
-			return 0, "", 0, fmt.Errorf("read domain length: %w", err)
-		}
-		domain := make([]byte, lenBuf[0])
-		if _, err = io.ReadFull(conn, domain); err != nil {
-			return 0, "", 0, fmt.Errorf("read domain: %w", err)
-		}
-		host = string(domain)
-	case 0x04: // IPv6
-		ip := make([]byte, 16)
-		if _, err = io.ReadFull(conn, ip); err != nil {
-			return 0, "", 0, fmt.Errorf("read IPv6: %w", err)
-		}
-		host = net.IP(ip).String()
-	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return 0, "", 0, fmt.Errorf("unsupported address type: 0x%02x", req[3])
-	}
-
-	portBuf := make([]byte, 2)
-	if _, err = io.ReadFull(conn, portBuf); err != nil {
-		return 0, "", 0, fmt.Errorf("read port: %w", err)
-	}
-	port = binary.BigEndian.Uint16(portBuf)
-	return cmd, host, port, nil
 }
 
 // parseSOCKS5UDPAddr parses the destination address from a SOCKS5 UDP datagram.

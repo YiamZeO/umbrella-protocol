@@ -1,4 +1,4 @@
-package client
+package shaper
 
 import (
 	"context"
@@ -25,9 +25,9 @@ type Phase struct {
 
 var Phases []Phase
 
-// loadPhases reads phases from YAML config file and populates the global Phases slice.
+// LoadPhases reads phases from YAML config file and populates the global Phases slice.
 // YAML uses map format with phase name as key.
-func loadPhases(filename string) error {
+func LoadPhases(filename string) error {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return err
@@ -97,12 +97,12 @@ func randPhaseDuration(p Phase) time.Duration {
 	return p.MinDuration + time.Duration(n.Int64())
 }
 
-// gUpBucket is the current upload rate bucket, atomically replaced on each phase change.
+// GUpBucket is the current upload rate bucket, atomically replaced on each phase change.
 // nil means no throttling (default/fallback behaviour).
-var gUpBucket atomic.Pointer[rateBucket]
+var GUpBucket atomic.Pointer[rateBucket]
 
-// gDownBucket is the current download rate bucket, atomically replaced on each phase change.
-var gDownBucket atomic.Pointer[rateBucket]
+// GDownBucket is the current download rate bucket, atomically replaced on each phase change.
+var GDownBucket atomic.Pointer[rateBucket]
 
 // rateBucket is a token-bucket rate limiter with a cancellable sleep.
 // When paused (bytesPerSec == 0), writes block entirely until the phase changes or expires.
@@ -182,27 +182,27 @@ func (b *rateBucket) refund(n int64) {
 	b.mu.Unlock()
 }
 
-// applyPhase updates the global rate buckets with new limits and starts a local
+// ApplyPhase updates the global rate buckets with new limits and starts a local
 // expiration timer for the phase. This is used by both the old server-driven and
 // the new local engine.
-func applyPhase(downMbps, upMbps float32, dur time.Duration, name string) {
+func ApplyPhase(downMbps, upMbps float32, dur time.Duration, name string) {
 	newUpBucket := newRateBucket(float64(upMbps) * 125_000)
-	if old := gUpBucket.Swap(newUpBucket); old != nil {
+	if old := GUpBucket.Swap(newUpBucket); old != nil {
 		close(old.done)
 	}
 
 	newDownBucket := newRateBucket(float64(downMbps) * 125_000)
-	if old := gDownBucket.Swap(newDownBucket); old != nil {
+	if old := GDownBucket.Swap(newDownBucket); old != nil {
 		close(old.done)
 	}
 
 	log.Printf("[shaper] → %s (%.1f↓ %.1f↑ Mbps, %s)", name, downMbps, upMbps, dur.Round(time.Millisecond))
 }
 
-// runShaperEngine runs the phase selection loop locally on the client.
+// RunShaperEngine runs the phase selection loop locally on the client.
 // No control stream to server is needed anymore. Phases are chosen randomly
 // (avoiding consecutive repeats), applied for random duration.
-func runShaperEngine(ctx context.Context) {
+func RunShaperEngine(ctx context.Context) {
 	lastIdx := -1
 	for {
 		select {
@@ -222,7 +222,7 @@ func runShaperEngine(ctx context.Context) {
 		p := Phases[idx]
 		dur := randPhaseDuration(p)
 
-		applyPhase(float32(p.DownMbps), float32(p.UpMbps), dur, p.Name)
+		ApplyPhase(float32(p.DownMbps), float32(p.UpMbps), dur, p.Name)
 
 		select {
 		case <-time.After(dur):
@@ -234,48 +234,48 @@ func runShaperEngine(ctx context.Context) {
 	}
 }
 
-// shapedWriter wraps an io.Writer and throttles each Write through an
+// ShapedWriter wraps an io.Writer and throttles each Write through an
 // atomically-updated rate bucket. When the bucket is superseded mid-sleep,
 // it immediately retries with the new bucket.
-type shapedWriter struct {
-	w      io.Writer
-	bucket *atomic.Pointer[rateBucket]
+type ShapedWriter struct {
+	W      io.Writer
+	Bucket *atomic.Pointer[rateBucket]
 }
 
-func (sw *shapedWriter) Write(p []byte) (n int, err error) {
+func (sw *ShapedWriter) Write(p []byte) (n int, err error) {
 	var b *rateBucket
 	for {
-		b = sw.bucket.Load()
+		b = sw.Bucket.Load()
 		if b == nil || b.wait(int64(len(p))) {
 			break
 		}
 		// bucket was superseded; loop to pick up the new one
 	}
-	n, err = sw.w.Write(p)
+	n, err = sw.W.Write(p)
 	if b != nil && n < len(p) {
 		b.refund(int64(len(p) - n))
 	}
 	return n, err
 }
 
-// shapedReader wraps an io.Reader and throttles each Read through an
+// ShapedReader wraps an io.Reader and throttles each Read through an
 // atomically-updated rate bucket.
 // Throttle *before* Read to apply backpressure on the network stream
 // (critical for effective download limiting).
-type shapedReader struct {
-	r      io.Reader
-	bucket *atomic.Pointer[rateBucket]
+type ShapedReader struct {
+	R      io.Reader
+	Bucket *atomic.Pointer[rateBucket]
 }
 
-func (sr *shapedReader) Read(p []byte) (n int, err error) {
+func (sr *ShapedReader) Read(p []byte) (n int, err error) {
 	var b *rateBucket
 	for {
-		b = sr.bucket.Load()
+		b = sr.Bucket.Load()
 		if b == nil || b.wait(int64(len(p))) {
 			break
 		}
 	}
-	n, err = sr.r.Read(p)
+	n, err = sr.R.Read(p)
 	if b != nil && n < len(p) {
 		b.refund(int64(len(p) - n))
 	}

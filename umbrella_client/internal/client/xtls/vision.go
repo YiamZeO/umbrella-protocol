@@ -1,4 +1,4 @@
-package client
+package xtls
 
 import (
 	"bufio"
@@ -295,7 +295,7 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 	visionRead, appWrite := io.Pipe()
 
 	vConn := &visionConn{
-		Conn:      &timeoutStream{Conn: stream},
+		Conn:      &timeoutConn{Conn: stream},
 		appReader: appRead,
 		appWriter: appWrite,
 	}

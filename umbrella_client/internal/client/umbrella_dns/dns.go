@@ -1,10 +1,8 @@
-package client
+package umbrella_dns
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -15,9 +13,48 @@ import (
 	"umbrella_client/internal/storage"
 )
 
-// runDNSServer starts a local DNS server that resolves queries via the tunnel.
+// ShouldBypass returns true if the host should be connected to directly.
+// Supports domains (including all subdomains) and IP CIDR ranges (e.g. "192.168.1.0/24").
+func ShouldBypass(host string, gBypass []string) bool {
+	if len(gBypass) == 0 {
+		return false
+	}
+
+	host = strings.ToLower(host)
+	hostIP := net.ParseIP(host)
+
+	for _, rule := range gBypass {
+		rule = strings.ToLower(rule)
+		if rule == "" {
+			continue
+		}
+
+		// 1. Try as CIDR (e.g. "192.168.1.0/24")
+		if hostIP != nil {
+			if _, ipnet, err := net.ParseCIDR(rule); err == nil {
+				if ipnet.Contains(hostIP) {
+					return true
+				}
+				continue
+			}
+		}
+
+		// 2. Exact match (works for both IPs and domains)
+		if host == rule {
+			return true
+		}
+
+		// 3. Domain suffix match (only if host is not an IP)
+		if hostIP == nil && strings.HasSuffix(host, "."+rule) {
+			return true
+		}
+	}
+	return false
+}
+
+// RunDNSServer starts a local DNS server that resolves queries via the tunnel.
 // It populates dnsCache with IP -> Hostname mappings to fix bypass-by-host.
-func runDNSServer(ctx context.Context, dnsCache *storage.DnsCache) {
+func RunDNSServer(ctx context.Context, dnsCache *storage.DnsCache, gBypass []string, gDNSListen, gDNSUpstream string, forwardDNS func(ctx context.Context, r *dns.Msg) (*dns.Msg, error)) {
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		msg := new(dns.Msg)
 		msg.SetReply(r)
@@ -32,7 +69,7 @@ func runDNSServer(ctx context.Context, dnsCache *storage.DnsCache) {
 		hostname := strings.TrimSuffix(q.Name, ".")
 
 		// Should we resolve this via a separate bypass DNS?
-		useBypassDNS := shouldBypass(hostname)
+		useBypassDNS := ShouldBypass(hostname, gBypass)
 
 		// Only handle A (IPv4) and AAAA (IPv6) for caching
 		if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
@@ -74,8 +111,7 @@ func runDNSServer(ctx context.Context, dnsCache *storage.DnsCache) {
 			}
 			if ip != "" {
 				dnsCache.Store(ip, hostname)
-				dnsCache.SetRevertValue(hostname, ip)
-				log.Printf("DNS: resolution success for %s (bypassDNS=%v): %s", hostname, useBypassDNS, ip)
+				log.Printf("[INFO] DNS: resolution success for %s (bypassDNS=%v): %s", hostname, useBypassDNS, ip)
 				break
 			}
 		}
@@ -89,18 +125,18 @@ func runDNSServer(ctx context.Context, dnsCache *storage.DnsCache) {
 		Handler: handler,
 	}
 
-	log.Printf("DNS server listening on %s (upstream: %s)", gDNSListen, gDNSUpstream)
+	log.Printf("[INFO] DNS server listening on %s (upstream: %s)", gDNSListen, gDNSUpstream)
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("DNS: shutting down server...")
+		log.Printf("[INFO] DNS: shutting down server...")
 		server.Shutdown()
 	}()
 
 	if err := server.ListenAndServe(); err != nil {
 		select {
 		case <-ctx.Done():
-			log.Printf("DNS: server stopped")
+			log.Printf("[INFO] DNS: server stopped")
 		default:
 			log.Printf("[ERR] DNS server error: %v", err)
 		}
@@ -149,86 +185,4 @@ func resolveDirectDNS(r *dns.Msg) (*dns.Msg, error) {
 	}
 
 	return resp, nil
-}
-
-// forwardDNS sends a DNS query to the upstream server via the Umbrella tunnel.
-func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
-	s, err := getSession(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get session: %w", err)
-	}
-
-	stream, err := openUDPStream(s)
-	if err != nil {
-		return nil, fmt.Errorf("open UDP stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Prepare length-prefixed UDP frame for our relay protocol:
-	// [4B len][ATYP+ADDR+PORT+DATA]
-	dnsData, err := r.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("pack dns: %w", err)
-	}
-
-	host, portStr, _ := net.SplitHostPort(gDNSUpstream)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
-
-	// Build relay header: [ATYP][ADDR][PORT]
-	var addrBytes []byte
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
-		} else {
-			addrBytes = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		addrBytes = append([]byte{0x03, byte(len(host))}, []byte(host)...)
-	}
-	var portBytes [2]byte
-	binary.BigEndian.PutUint16(portBytes[:], port)
-
-	payload := append(addrBytes, portBytes[:]...)
-	payload = append(payload, dnsData...)
-
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-
-	if _, err := stream.Write(lenBuf); err != nil {
-		return nil, err
-	}
-	if _, err := stream.Write(payload); err != nil {
-		return nil, err
-	}
-
-	// Read response
-	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		return nil, err
-	}
-	respLen := binary.BigEndian.Uint32(lenBuf)
-	respPayload := make([]byte, respLen)
-	if _, err := io.ReadFull(stream, respPayload); err != nil {
-		return nil, err
-	}
-
-	// Skip ATYP+ADDR+PORT in response (server returns them)
-	// Response from server is [ATYP][ADDR][PORT][DATA]
-	off := 0
-	switch respPayload[0] {
-	case 0x01:
-		off = 1 + 4 + 2
-	case 0x04:
-		off = 1 + 16 + 2
-	case 0x03:
-		off = 1 + 1 + int(respPayload[1]) + 2
-	}
-
-	respMsg := new(dns.Msg)
-	if err := respMsg.Unpack(respPayload[off:]); err != nil {
-		return nil, fmt.Errorf("unpack dns resp: %w", err)
-	}
-
-	return respMsg, nil
 }

@@ -201,12 +201,12 @@ func DnsCacheFilePath(appFilesDir string) string {
 
 type DnsCache struct {
 	mu   sync.RWMutex
-	data map[string]any
+	data map[string]string
 }
 
 func NewDnsCache() *DnsCache {
 	return &DnsCache{
-		data: make(map[string]any),
+		data: make(map[string]string),
 	}
 }
 
@@ -217,16 +217,16 @@ func (d *DnsCache) Load(key string) (any, bool) {
 	return v, ok
 }
 
-func (d *DnsCache) Store(key string, value any) {
+func (d *DnsCache) Store(key string, value string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.data[key] = value
 }
 
-func (d *DnsCache) LoadAll() map[string]any {
+func (d *DnsCache) LoadAll() map[string]string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	result := make(map[string]any, len(d.data))
+	result := make(map[string]string, len(d.data))
 	for k, v := range d.data {
 		result[k] = v
 	}
@@ -243,33 +243,9 @@ func (d *DnsCache) Range(f func(key, value any) bool) {
 	}
 }
 
-func (d *DnsCache) GetRevertMap() map[string]any {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if revert, ok := d.data["revert"]; ok {
-		if m, ok := revert.(map[string]any); ok {
-			return m
-		}
-	}
-	m := make(map[string]any)
-	d.data["revert"] = m
-	return m
-}
-
-func (d *DnsCache) SetRevertValue(hostname, ip string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	revert, ok := d.data["revert"]
-	if !ok {
-		revert = make(map[string]any)
-		d.data["revert"] = revert
-	}
-	revert.(map[string]any)[hostname] = ip
-}
-
 type dnsCacheFile struct {
-	Data      map[string]any `json:"data"`
-	Timestamp time.Time      `json:"timestamp"`
+	Data      map[string]string `json:"data"`
+	Timestamp time.Time         `json:"timestamp"`
 }
 
 func LoadDnsCache(appFilesDir string) (*DnsCache, error) {
@@ -283,7 +259,7 @@ func LoadDnsCache(appFilesDir string) (*DnsCache, error) {
 		return NewDnsCache(), err
 	}
 	d := &DnsCache{
-		data: make(map[string]any),
+		data: make(map[string]string),
 	}
 	for k, v := range cf.Data {
 		d.data[k] = v

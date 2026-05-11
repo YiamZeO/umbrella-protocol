@@ -1,10 +1,11 @@
-package main
+package xtls
 
 import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Vision — слой фрейминга поверх yamux-потока, скрывающий сигнатуру TLS-in-TLS.
@@ -28,13 +29,24 @@ const (
 	maxVisionPadding = 255
 )
 
+var visionBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 17*1024) // Достаточно для TLS рекорда (16кб) + заголовок
+		return &b
+	},
+}
+
 // visionCopyToTunnel читает raw inner TLS из src, оборачивает каждый record
 // Vision-фреймом, шлёт в dst. После первого AppData шлёт sentinel + splice.
-// Для throttle (SmartShaper ↓): передавайте dst уже обёрнутым в downWriter.
 func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 	hdr := make([]byte, 5)
 	sentinel := [2]byte{0xFF, 0xFF}
 	framePfx := make([]byte, 2)
+	padBuf := make([]byte, maxVisionPadding) // Отдельный буфер для паддинга
+
+	bufPtr := visionBufPool.Get().(*[]byte)
+	defer visionBufPool.Put(bufPtr)
+	body := *bufPtr
 
 	for {
 		if _, err := io.ReadFull(src, hdr); err != nil {
@@ -43,8 +55,11 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 		recordType := hdr[0]
 		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
-		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(src, body); err != nil {
+		if bodyLen > len(body) {
+			return fmt.Errorf("vision: record body too large %d", bodyLen)
+		}
+
+		if _, err := io.ReadFull(src, body[:bodyLen]); err != nil {
 			return err
 		}
 
@@ -55,7 +70,7 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 			if _, err := dst.Write(hdr); err != nil {
 				return err
 			}
-			if _, err := dst.Write(body); err != nil {
+			if _, err := dst.Write(body[:bodyLen]); err != nil {
 				return err
 			}
 			_, err := io.Copy(dst, src)
@@ -72,7 +87,7 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 			return err
 		}
 		if padLen > 0 {
-			pad := make([]byte, padLen)
+			pad := padBuf[:padLen]
 			if _, err := rand.Read(pad); err != nil {
 				return fmt.Errorf("vision rand pad: %w", err)
 			}
@@ -83,7 +98,7 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 		if _, err := dst.Write(hdr); err != nil {
 			return err
 		}
-		if _, err := dst.Write(body); err != nil {
+		if _, err := dst.Write(body[:bodyLen]); err != nil {
 			return err
 		}
 	}
@@ -94,6 +109,10 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
 	pfxBuf := make([]byte, 2)
 	hdr := make([]byte, 5)
+
+	bufPtr := visionBufPool.Get().(*[]byte)
+	defer visionBufPool.Put(bufPtr)
+	body := *bufPtr
 
 	for {
 		if _, err := io.ReadFull(src, pfxBuf); err != nil {
@@ -107,8 +126,10 @@ func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
 		}
 
 		if padLen > 0 {
-			discard := make([]byte, padLen)
-			if _, err := io.ReadFull(src, discard); err != nil {
+			if int(padLen) > len(body) {
+				return fmt.Errorf("vision: pad too large %d", padLen)
+			}
+			if _, err := io.ReadFull(src, body[:padLen]); err != nil {
 				return err
 			}
 		}
@@ -117,15 +138,17 @@ func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
 			return err
 		}
 		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
-		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(src, body); err != nil {
+		if bodyLen > len(body) {
+			return fmt.Errorf("vision: body too large %d", bodyLen)
+		}
+		if _, err := io.ReadFull(src, body[:bodyLen]); err != nil {
 			return err
 		}
 
 		if _, err := dst.Write(hdr); err != nil {
 			return err
 		}
-		if _, err := dst.Write(body); err != nil {
+		if _, err := dst.Write(body[:bodyLen]); err != nil {
 			return err
 		}
 	}
