@@ -35,3 +35,5 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260512111648-6d2d2fc87c8c

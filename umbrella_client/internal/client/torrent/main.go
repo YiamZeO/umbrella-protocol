@@ -80,9 +80,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 	copy(gBypass, cfg.Bypass)
 
 	gSessionsNum = cfg.Torrent.SessionsNum
-	if gSessionsNum < 1 {
-		gSessionsNum = 5
-	}
 	sessions = make([]*yamux.Session, gSessionsNum)
 	sessMu = make([]sync.Mutex, gSessionsNum)
 
@@ -650,7 +647,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.LogOutput = io.Discard
 
-	sess, err := yamux.Client(&TorrentConn{Conn: s}, muxCfg)
+	sess, err := yamux.Client(NewTorrentConn(s), muxCfg)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -849,8 +846,29 @@ func generatePeerID() [20]byte {
 type TorrentConn struct {
 	net.Conn
 	reader           *bufio.Reader
+	writer           *bufio.Writer
 	remainingPayload int
 	remainingPadding int
+	flushTimer       *time.Timer
+	mu               sync.Mutex
+}
+
+func NewTorrentConn(conn net.Conn) *TorrentConn {
+	tc := &TorrentConn{
+		Conn:   conn,
+		reader: bufio.NewReaderSize(conn, 256*1024),
+	}
+	// Оборачиваем запись в буфер для снижения оверхеда паддинга
+	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
+	return tc
+}
+
+type rawPieceWriter struct {
+	tc *TorrentConn
+}
+
+func (w *rawPieceWriter) Write(p []byte) (int, error) {
+	return w.tc.writePiece(p)
 }
 
 func (c *TorrentConn) Read(p []byte) (n int, err error) {
@@ -932,41 +950,48 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *TorrentConn) Write(p []byte) (n int, err error) {
-	const bittorrentHeadLen = 4 + 1 + 4 + 4 // Length + ID + Index + Offset
-	const internalHeadLen = 2               // PayloadLen
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Выбираем рандомный размер паддинга (0..255 байт)
+	n, err = c.writer.Write(p)
+
+	// Сбрасываем/запускаем таймер авто-флаша для минимизации задержек
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+	}
+	c.flushTimer = time.AfterFunc(5*time.Millisecond, func() {
+		c.mu.Lock()
+		c.writer.Flush()
+		c.mu.Unlock()
+	})
+
+	return n, err
+}
+
+// Внутренний метод записи уже сформированного торрент-пакета
+func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
+	const bittorrentHeadLen = 9
+	const internalHeadLen = 2
 	padLen := mrand.Intn(256)
 
 	bufPtr := share.UDPBufPool.Get().(*[]byte)
 	defer share.UDPBufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	totalMsgLen := 9 + internalHeadLen + len(p) + padLen
+	totalMsgLen := bittorrentHeadLen + internalHeadLen + len(p) + padLen
 	binary.BigEndian.PutUint32(buf[0:4], uint32(totalMsgLen))
 	buf[4] = pieceMsgID
-	binary.BigEndian.PutUint32(buf[5:9], 0)  // Index
-	binary.BigEndian.PutUint32(buf[9:13], 0) // Offset
-
-	// Наш внутренний заголовок
+	binary.BigEndian.PutUint32(buf[5:9], 0)
+	binary.BigEndian.PutUint32(buf[9:13], 0)
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(p)))
-
-	// Данные
 	copy(buf[15:], p)
 
-	// Паддинг (используем то что уже было в буфере для скорости или забиваем мусором)
 	if padLen > 0 {
-		// Для лучшей энтропии можно забить случайными данными,
-		// но на практике мусор из пула буферов тоже неплох.
-		// Забьем немного реального рандома для надежности.
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])
 	}
 
 	_, err = c.Conn.Write(buf[:4+totalMsgLen])
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	return len(p), err
 }
 
 func startWhiteNoise(ctx context.Context) {

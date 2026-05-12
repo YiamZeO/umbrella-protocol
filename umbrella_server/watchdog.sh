@@ -12,13 +12,14 @@ while true; do
     # Проверяем наличие процесса по имени
     if ! pgrep -l "$PROCESS_NAME" > /dev/null; then
         echo "[$(date)] $PROCESS_NAME not found! Restarting..."
-
+        
         # Запуск сервера в фоне с перенаправлением логов
+        # Используем nohup для стабильности при закрытии терминала
         nohup $EXEC_COMMAND > "$LOG_FILE" 2>&1 &
-
+        
         echo "[$(date)] $PROCESS_NAME restarted with PID $!"
     fi
-
+    
     # Ожидание перед следующей проверкой
     sleep $CHECK_INTERVAL
 done

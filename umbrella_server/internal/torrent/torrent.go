@@ -227,7 +227,7 @@ func handleUmbrellaSess(conn net.Conn) {
 	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
 
 	// Wrap connection with piece framing
-	tConn := &TorrentConn{Conn: conn}
+	tConn := NewTorrentConn(conn)
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
@@ -532,15 +532,31 @@ func handleDNSQuery(stream net.Conn, clientAddr net.Addr) {
 type TorrentConn struct {
 	net.Conn
 	reader           *bufio.Reader
+	writer           *bufio.Writer
 	remainingPayload int
 	remainingPadding int
+	flushTimer       *time.Timer
+	mu               sync.Mutex
+}
+
+func NewTorrentConn(conn net.Conn) *TorrentConn {
+	tc := &TorrentConn{
+		Conn:   conn,
+		reader: bufio.NewReaderSize(conn, 256*1024),
+	}
+	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
+	return tc
+}
+
+type rawPieceWriter struct {
+	tc *TorrentConn
+}
+
+func (w *rawPieceWriter) Write(p []byte) (int, error) {
+	return w.tc.writePiece(p)
 }
 
 func (c *TorrentConn) Read(p []byte) (n int, err error) {
-	if c.reader == nil {
-		c.reader = bufio.NewReaderSize(c.Conn, 256*1024)
-	}
-
 	for {
 		if c.remainingPayload > 0 {
 			toRead := c.remainingPayload
@@ -607,6 +623,21 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *TorrentConn) Write(p []byte) (n int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n, err = c.writer.Write(p)
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+	}
+	c.flushTimer = time.AfterFunc(5*time.Millisecond, func() {
+		c.mu.Lock()
+		c.writer.Flush()
+		c.mu.Unlock()
+	})
+	return n, err
+}
+
+func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	const internalHeadLen = 2
 	padLen := mrand.Intn(256)
 
@@ -627,5 +658,6 @@ func (c *TorrentConn) Write(p []byte) (n int, err error) {
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])
 	}
 
-	return c.Conn.Write(buf[:4+totalMsgLen])
+	_, err = c.Conn.Write(buf[:4+totalMsgLen])
+	return len(p), err
 }
