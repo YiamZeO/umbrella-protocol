@@ -15,42 +15,33 @@ import (
 
 // Vision — слой фрейминга поверх yamux-потока, скрывающий сигнатуру TLS-in-TLS.
 //
-// Фаза Handshake (record types 0x14, 0x15, 0x16):
-// каждый inner TLS record оборачивается в Vision-фрейм:
+// Все TLS record'ы (handshake, CCS, Alert и Application Data) оборачиваются
+// в Vision-фрейм:
 //
 //	[2 bytes: padding_len, big-endian]   ← случайное 0..255
 //	[padding_len bytes: random noise]
 //	[5 bytes: оригинальный TLS record header]
 //	[body_len bytes: оригинальный TLS record body]
 //
-// Фаза Splice (после первого Application Data, type 0x17):
-// writer шлёт sentinel [0xFF 0xFF], затем переключается на io.Copy.
-// Reader видит sentinel и тоже переключается на io.Copy.
-//
-// Каждое направление (upload / download) переключается независимо.
 // SmartShaper применяется на уровне writer'а до передачи в Vision:
 // caller сам оборачивает dst в shapedWriter — vision.go этого не знает.
 
 const (
-	visionSentinel = uint16(0xFFFF)
+	maxVisionPadding = 255
 )
 
 // visionCopyToTunnel читает raw inner TLS из src (app-соединение или remote),
-// обворачивает каждый record Vision-фреймом, шлёт в dst (yamux stream или conn).
-// После первого AppData отправляет sentinel и переходит в splice (io.Copy).
+// оборачивает каждый record Vision-фреймом, шлёт в dst (yamux stream или conn).
 // SmartShaper: передайте dst уже обёрнутым в shapedWriter, если нужен throttle.
 func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 	br := bufio.NewReaderSize(src, 32*1024)
 	hdr := make([]byte, 5)
-	sentinel := [2]byte{0xFF, 0xFF}
 	framePfx := make([]byte, 2)
 
 	for {
-		// Читаем TLS record header (type 1 + ver 2 + len 2 = 5 байт).
 		if _, err := io.ReadFull(br, hdr); err != nil {
 			return err
 		}
-		recordType := hdr[0]
 		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
 		body := make([]byte, bodyLen)
@@ -58,22 +49,6 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 			return err
 		}
 
-		if recordType == 0x17 { // Application Data → sentinel + splice
-			if _, err := dst.Write(sentinel[:]); err != nil {
-				return err
-			}
-			// Первую AppData запись шлём raw.
-			if _, err := dst.Write(hdr); err != nil {
-				return err
-			}
-			if _, err := dst.Write(body); err != nil {
-				return err
-			}
-			_, err := io.Copy(dst, br)
-			return err
-		}
-
-		// Handshake / CCS / Alert → Vision-фрейм.
 		padLen, err := visionRandPadLen()
 		if err != nil {
 			return fmt.Errorf("vision rand: %w", err)
@@ -101,8 +76,7 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 }
 
 // visionCopyFromTunnel читает Vision-фреймированные данные из src (yamux stream),
-// снимает padding в фазе Handshake, после sentinel переключается на splice.
-// Пишет raw inner TLS в dst (app-соединение).
+// снимает padding, пишет raw inner TLS в dst (app-соединение).
 func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
 	br := bufio.NewReaderSize(src, 32*1024)
 	pfxBuf := make([]byte, 2)
@@ -114,13 +88,6 @@ func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
 		}
 		padLen := binary.BigEndian.Uint16(pfxBuf)
 
-		if padLen == visionSentinel {
-			// Splice: остальное идёт raw.
-			_, err := io.Copy(dst, br)
-			return err
-		}
-
-		// Отбрасываем padding.
 		if padLen > 0 {
 			discard := make([]byte, padLen)
 			if _, err := io.ReadFull(br, discard); err != nil {

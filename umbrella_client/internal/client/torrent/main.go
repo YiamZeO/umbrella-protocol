@@ -14,7 +14,6 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"net"
-	"net/http"
 	_ "net/http/pprof"
 	"strconv"
 	"strings"
@@ -63,12 +62,12 @@ var (
 // Start initializes and runs the Torrent client module.
 func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
 	// Start pprof server for memory profiling
-	go func() {
-		log.Println("[INFO] Starting pprof server on localhost:6060")
-		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-			log.Printf("[ERR] pprof server: %v", err)
-		}
-	}()
+	// go func() {
+	// 	log.Println("[INFO] Starting pprof server on localhost:6060")
+	// 	if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+	// 		log.Printf("[ERR] pprof server: %v", err)
+	// 	}
+	// }()
 
 	cfg = c
 	gServerAddr = cfg.Server
@@ -141,9 +140,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}()
 	}
 
-	// Start SOCKS5 listener
-	go listenSOCKS5(ctx, dnsCache)
-
 	// Start White Noise generator (Trackers Announce)
 	go startWhiteNoise(ctx)
 
@@ -155,25 +151,19 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}()
 	}
 
-	log.Printf("[INFO] Umbrella/Torrent client (uTP) on %s → %s", cfg.ListenAddr, cfg.Server)
-
-	<-ctx.Done()
-	log.Printf("[INFO] Umbrella/Torrent client listener closed, stopping")
-	return nil
-}
-
-func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		log.Printf("[ERR] SOCKS5 listen: %v", err)
-		return
+		return fmt.Errorf("failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
 	defer ln.Close()
+
+	log.Printf("[INFO] Umbrella/Torrent client (uTP) on %s → %s", cfg.ListenAddr, cfg.Server)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			log.Printf("[INFO] Umbrella/Torrent client listener closed, stopping")
+			return nil
 		default:
 		}
 		conn, err := ln.Accept()

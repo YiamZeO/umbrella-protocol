@@ -128,8 +128,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}()
 	}
 
-	go listenSOCKS5(ctx, dnsCache)
-
 	if gDNSListen != "" {
 		wg.Add(1)
 		go func() {
@@ -138,45 +136,36 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}()
 	}
 
-	log.Printf("[INFO] Umbrella/Hysteria client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
-
-	<-ctx.Done()
-
-	log.Printf("[INFO] Umbrella/Hysteria client listener closed, stopping")
-
-	tcpSessionsMu.Lock()
-	for _, s := range tcpSessions {
-		if s.tcpConn != nil {
-			s.tcpConn.Close()
-		}
-	}
-	tcpSessions = nil
-	tcpSessionsMu.Unlock()
-
-	clientPoolMu.Lock()
-	for _, c := range clientPool {
-		if c != nil {
-			c.Close()
-		}
-	}
-	clientPool = nil
-	clientPoolMu.Unlock()
-
-	return nil
-}
-
-func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
 	ln, err := net.Listen("tcp", gListenAddr)
 	if err != nil {
-		log.Printf("[ERR] SOCKS5 listen: %v", err)
-		return
+		return fmt.Errorf("failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
 	defer ln.Close()
+
+	log.Printf("[INFO] Umbrella/Hysteria client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			log.Printf("[INFO] Umbrella/Hysteria client listener closed, stopping")
+			tcpSessionsMu.Lock()
+			for _, s := range tcpSessions {
+				if s.tcpConn != nil {
+					s.tcpConn.Close()
+				}
+			}
+			tcpSessions = nil
+			tcpSessionsMu.Unlock()
+
+			clientPoolMu.Lock()
+			for _, c := range clientPool {
+				if c != nil {
+					c.Close()
+				}
+			}
+			clientPool = nil
+			clientPoolMu.Unlock()
+			return nil
 		default:
 		}
 
@@ -191,6 +180,9 @@ func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
 		wg.Add(1)
 		go handleSOCKS5(ctx, conn, dnsCache)
 	}
+}
+
+func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
 }
 
 func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {

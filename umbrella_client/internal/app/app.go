@@ -34,7 +34,7 @@ import (
 	"umbrella_client/internal/windows"
 )
 
-func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, appRef fyne.App, isRunning *bool, ctx context.Context, startEnabled, stopEnabled binding.Bool, onceLog *sync.Once) {
+func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, appRef fyne.App, isRunning *bool, ctx context.Context, startEnabled, stopEnabled binding.Bool, onceLog *sync.Once, dnsCache *storage.DnsCache) {
 	// Set up logging first to capture all output
 	onceLog.Do(func() {
 		log.SetOutput(&logging.LogWriter{LogsContainer: l})
@@ -98,11 +98,6 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 
 	// Run client in a goroutine
 	go func() {
-		dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
-		if err != nil {
-			l.AppendLog("[ERR] Failed load dns cache. Created new: " + err.Error())
-		}
-
 		defer func() {
 			// Ensure we always call finish and handle panics
 			if r := recover(); r != nil {
@@ -166,6 +161,16 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 			}
 
 			l.AppendLog(fmt.Sprintf("[ERR] Client failed to start: %v", err))
+			if runtime.GOOS != "android" {
+				var comm string
+				switch runtime.GOOS {
+				case "windows":
+					comm = "net stop winnat && net start winnat"
+				case "linux":
+					comm = "sudo sh -c fuser -k 1080/tcp"
+				}
+				l.AppendLog(fmt.Sprintf("[ERR] If port problem try this command in terminal: '%s'", comm))
+			}
 			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
 		} else {
 			l.AppendLog("Client stopped gracefully")
@@ -419,6 +424,11 @@ func CreateAndRun() {
 
 	isRunning := false
 
+	dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
+	if err != nil {
+		lg.AppendLog("[ERR] Failed load dns cache. Created new: " + err.Error())
+	}
+
 	startBtn.OnTapped = func() {
 		if isRunning {
 			lg.AppendLog("[Warning] Start requested but client is already running")
@@ -431,7 +441,7 @@ func CreateAndRun() {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelFunc = cancel
 		var onceLog sync.Once
-		go initAndStart(appSettings, lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog)
+		go initAndStart(appSettings, lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog, dnsCache)
 		if appSettings.Timer > 0 {
 			go func() {
 				var (
@@ -484,7 +494,7 @@ func CreateAndRun() {
 		if settingsWin != nil {
 			settingsWin.Close()
 		}
-		settingsWin = windows.NewSettingsWindow(myApp, appSettings, lg)
+		settingsWin = windows.NewSettingsWindow(myApp, appSettings, lg, dnsCache)
 		settingsWin.Show()
 	})
 

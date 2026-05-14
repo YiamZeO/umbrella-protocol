@@ -210,6 +210,13 @@ func NewDnsCache() *DnsCache {
 	}
 }
 
+func (d *DnsCache) Clear() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.data = nil
+	d.data = make(map[string]string)
+}
+
 func (d *DnsCache) Load(key string) (any, bool) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -265,6 +272,28 @@ func LoadDnsCache(appFilesDir string) (*DnsCache, error) {
 		d.data[k] = v
 	}
 	return d, nil
+}
+
+func ClearDnsCache(d *DnsCache, appFilesDir string) error {
+	d.Clear()
+	p := DnsCacheFilePath(appFilesDir)
+
+	if appFilesDir != "" {
+		_ = os.MkdirAll(appFilesDir, 0o755)
+	}
+
+	data := d.LoadAll()
+	cf := dnsCacheFile{
+		Data:      data,
+		Timestamp: time.Now(),
+	}
+
+	b, err := json.Marshal(cf)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(p, b, 0o644)
 }
 
 func SaveDnsCache(d *DnsCache, appFilesDir string) error {

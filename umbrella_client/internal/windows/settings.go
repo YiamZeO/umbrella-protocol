@@ -21,7 +21,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *logging.LogsContainer) fyne.Window {
+func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *logging.LogsContainer, dnsCache *storage.DnsCache) fyne.Window {
 	settingsWin := appRef.NewWindow("Settings")
 	settingsWin.SetIcon(theme.SettingsIcon())
 
@@ -32,6 +32,15 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 	header := container.NewHBox(iconW, widget.NewLabel(" "), titleLbl)
 	headerBg := canvas.NewRectangle(ui.ColorToNRGBA(ui.CurrentTheme.Overlay))
 	headerStack := container.NewStack(headerBg, container.NewPadded(header))
+
+	clearDnsCacheBtn := widget.NewButtonWithIcon("Clear DNS cache", theme.DeleteIcon(), func() {
+		err := storage.ClearDnsCache(dnsCache, appSettings.AppFilesDir)
+		if err != nil {
+			dialogs.ShowStyledError(settingsWin, "Clear DNS cache error", err.Error())
+			l.AppendLog("[ERR] Failed clear DNS cache: " + err.Error())
+		}
+		l.AppendLog("[INFO] Clear DNS cache: OK")
+	})
 
 	var configWin fyne.Window
 	configBtn := widget.NewButtonWithIcon("Config", theme.DocumentCreateIcon(), func() {
@@ -263,14 +272,16 @@ func NewSettingsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *lo
 	body := container.NewVBox(
 		configBtn,
 		phasesBtn,
-		themeBtn,
-		fontsBtn,
-		timerBtn,
+		clearDnsCacheBtn,
 	)
 
 	if runtime.GOOS != "android" {
 		body.Add(tunnelCoreBtn)
 	}
+
+	body.Add(themeBtn)
+	body.Add(fontsBtn)
+	body.Add(timerBtn)
 
 	var bottom fyne.CanvasObject
 	bottomBg := canvas.NewRectangle(ui.ColorToNRGBA(ui.CurrentTheme.Overlay))
