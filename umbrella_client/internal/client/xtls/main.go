@@ -205,7 +205,7 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
 
-	stream, err := openUDPStream(s)
+	stream, err := openVisionUDPStream(s)
 	if err != nil {
 		return nil, fmt.Errorf("open UDP stream: %w", err)
 	}
@@ -240,23 +240,13 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 	payload := append(addrBytes, portBytes[:]...)
 	payload = append(payload, dnsData...)
 
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-
-	if _, err := stream.Write(lenBuf); err != nil {
-		return nil, err
-	}
-	if _, err := stream.Write(payload); err != nil {
+	if err := visionWriteDatagram(stream, payload); err != nil {
 		return nil, err
 	}
 
 	// Read response
-	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		return nil, err
-	}
-	respLen := binary.BigEndian.Uint32(lenBuf)
-	respPayload := make([]byte, respLen)
-	if _, err := io.ReadFull(stream, respPayload); err != nil {
+	respPayload, err := visionReadDatagram(stream)
+	if err != nil {
 		return nil, err
 	}
 
@@ -544,80 +534,9 @@ func (ts *timeoutConn) Write(p []byte) (n int, err error) {
 	return
 }
 
-// openStream opens a new yamux stream and sends the tunnel destination.
-// Returns a ready-to-use net.Conn for bidirectional data transfer.
-func openStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
-	stream, err := s.Open()
-	if err != nil {
-		// Session may have died; clear it so getSession creates a fresh one.
-		for i := 0; i < gSessionsNum; i++ {
-			sessMu[i].Lock()
-			if sessions[i] == s {
-				sessions[i] = nil
-			}
-			sessMu[i].Unlock()
-		}
-		return nil, err
-	}
-
-	// Send destination: [atyp][addr][port]
-	var addrBytes []byte
-	ip := net.ParseIP(destHost)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
-		} else {
-			addrBytes = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		if len(destHost) > 255 {
-			go stream.Close()
-			return nil, fmt.Errorf("domain name too long: %d bytes", len(destHost))
-		}
-		addrBytes = append([]byte{0x03, byte(len(destHost))}, []byte(destHost)...)
-	}
-
-	var portBytes [2]byte
-	binary.BigEndian.PutUint16(portBytes[:], destPort)
-
-	req := append([]byte{0x00}, addrBytes...)
-	req = append(req, portBytes[:]...)
-	if gConnectionsTimeOut > 0 {
-		stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	if _, err := stream.Write(req); err != nil {
-		go stream.Close()
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			dropStalledSession(s)
-		}
-		return nil, fmt.Errorf("write tunnel request: %w", err)
-	}
-
-	// Read server response: 0x00 = ok, 0x01 = error
-	var respBuf [1]byte
-	if gConnectionsTimeOut > 0 {
-		stream.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	if _, err := io.ReadFull(stream, respBuf[:]); err != nil {
-		go stream.Close()
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			dropStalledSession(s)
-		}
-		return nil, fmt.Errorf("read tunnel response: %w", err)
-	}
-	if respBuf[0] != 0x00 {
-		go stream.Close()
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			dropStalledSession(s)
-		}
-		return nil, fmt.Errorf("server rejected connection to %s:%d", destHost, destPort)
-	}
-
-	return &timeoutConn{Conn: stream}, nil
-}
-
-// openUDPStream opens a yamux stream for UDP relay and returns it after server ACK.
-func openUDPStream(s *yamux.Session) (net.Conn, error) {
+// openVisionUDPStream opens a yamux stream for Vision-UDP relay and returns it after server ACK.
+// Uses cmd=0x01 to indicate Vision framing for UDP datagrams.
+func openVisionUDPStream(s *yamux.Session) (net.Conn, error) {
 	stream, err := s.Open()
 	if err != nil {
 		for i := 0; i < gSessionsNum; i++ {
@@ -637,7 +556,7 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			dropStalledSession(s)
 		}
-		return nil, fmt.Errorf("write UDP cmd: %w", err)
+		return nil, fmt.Errorf("write Vision UDP cmd: %w", err)
 	}
 	var ack [1]byte
 	if gConnectionsTimeOut > 0 {
@@ -648,14 +567,14 @@ func openUDPStream(s *yamux.Session) (net.Conn, error) {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			dropStalledSession(s)
 		}
-		return nil, fmt.Errorf("read UDP ack: %w", err)
+		return nil, fmt.Errorf("read Vision UDP ack: %w", err)
 	}
 	if ack[0] != 0x00 {
 		go stream.Close()
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			dropStalledSession(s)
 		}
-		return nil, fmt.Errorf("server rejected UDP relay")
+		return nil, fmt.Errorf("server rejected Vision UDP relay")
 	}
 	return &timeoutConn{Conn: stream}, nil
 }
@@ -684,6 +603,7 @@ func (ts *timeoutPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 // It opens a yamux UDP relay stream to the server, binds a local UDP socket,
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
+// Uses Vision framing for all UDP datagrams.
 func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.DnsCache) {
 	var (
 		err    error
@@ -697,9 +617,9 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 			tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
-		stream, err = openUDPStream(s)
+		stream, err = openVisionUDPStream(s)
 		if err != nil {
-			log.Printf("[ERR] UDP ASSOCIATE stream error: %v", err)
+			log.Printf("[ERR] Vision UDP ASSOCIATE stream error: %v", err)
 			continue
 		} else {
 			break
@@ -756,7 +676,6 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 
 		frameBufPtr := share.UDPBufPool.Get().(*[]byte)
 		defer share.UDPBufPool.Put(frameBufPtr)
-		frameBuf := *frameBufPtr
 
 		for {
 			select {
@@ -838,11 +757,9 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				continue
 			}
 
-			// Not bypass. Send through tunnel.
+			// Not bypass. Send through tunnel with Vision framing.
 			payload := buf[3:n] // ATYP + ADDR + PORT + DATA
-			binary.BigEndian.PutUint32(frameBuf[:4], uint32(len(payload)))
-			copy(frameBuf[4:], payload)
-			if _, err := relayWriter.Write(frameBuf[:4+len(payload)]); err != nil {
+			if err := visionWriteDatagram(relayWriter, payload); err != nil {
 				return
 			}
 		}
@@ -851,7 +768,6 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 	// Server → App (Tunnel responses)
 	go func() {
 		defer cancel()
-		lenBuf := make([]byte, 4)
 		pktBufPtr := share.UDPBufPool.Get().(*[]byte)
 		defer share.UDPBufPool.Put(pktBufPtr)
 		pktBuf := *pktBufPtr
@@ -862,15 +778,8 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				return
 			default:
 			}
-			if _, err := io.ReadFull(relayReader, lenBuf); err != nil {
-				return
-			}
-			payloadLen := binary.BigEndian.Uint32(lenBuf)
-			if payloadLen > 65535 {
-				return
-			}
-			payload := pktBuf[3 : 3+payloadLen]
-			if _, err := io.ReadFull(relayReader, payload); err != nil {
+			payload, err := visionReadDatagram(relayReader)
+			if err != nil {
 				return
 			}
 			addrMu.Lock()
@@ -879,7 +788,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 			if a == nil {
 				continue
 			}
-			udpConn.WriteTo(pktBuf[:3+payloadLen], a)
+			udpConn.WriteTo(pktBuf[:3+len(payload)], a)
 		}
 	}()
 
@@ -930,16 +839,6 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	// so that the client sends its first data payload, allowing us to peek it.
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// Peek the first byte from the client application.
-	pc, firstByte, err := peekOneByte(conn)
-	if err != nil {
-		log.Printf("[ERR] Failed to peek first byte from %s: %v", conn.RemoteAddr(), err)
-		return
-	}
-
-	// Use Vision framing if it looks like a TLS handshake (0x16).
-	useVision := firstByte == 0x16
-
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	var (
@@ -952,13 +851,9 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 			log.Printf("[ERR] getSession error for %s → %v", target, err)
 			return
 		}
-		if useVision {
-			stream, err = openVisionStream(s, host, port)
-		} else {
-			stream, err = openStream(s, host, port)
-		}
+		stream, err = openVisionStream(s, host, port)
 		if err != nil {
-			log.Printf("[ERR] Stream open error for %s (vision=%v) → %v", target, useVision, err)
+			log.Printf("[ERR] Stream open error for %s → %v", target, err)
 		} else {
 			break
 		}
@@ -972,7 +867,7 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		go stream.Close()
 	}()
 
-	log.Printf("[INFO] Tunneling %s → %s (vision=%v)", conn.RemoteAddr(), target, useVision)
+	log.Printf("[INFO] Tunneling %s → %s", conn.RemoteAddr(), target)
 
 	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
@@ -985,7 +880,7 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		if gShaper {
 			dst = &shaper.ShapedWriter{W: stream, Bucket: &shaper.GUpBucket}
 		}
-		io.CopyBuffer(dst, pc, *b)
+		io.CopyBuffer(dst, conn, *b)
 		share.CloseWrite(stream)
 	}()
 
@@ -997,7 +892,7 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		if gShaper {
 			src = &shaper.ShapedReader{R: stream, Bucket: &shaper.GDownBucket}
 		}
-		io.CopyBuffer(pc, src, *b)
+		io.CopyBuffer(conn, src, *b)
 	}()
 
 	select {

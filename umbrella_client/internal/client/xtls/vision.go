@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,35 +31,46 @@ const (
 	maxVisionPadding = 255
 )
 
-// visionCopyToTunnel читает raw inner TLS из src (app-соединение или remote),
-// оборачивает каждый record Vision-фреймом, шлёт в dst (yamux stream или conn).
-// SmartShaper: передайте dst уже обёрнутым в shapedWriter, если нужен throttle.
+// visionCopyToTunnel reads raw data from src, wraps each chunk in a Vision frame with padding,
+// and writes it to dst. This version is universal and doesn't assume src is TLS.
 func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 	br := bufio.NewReaderSize(src, 32*1024)
+	buf := make([]byte, 16*1024) // Chunk size for framing
 	hdr := make([]byte, 5)
 	framePfx := make([]byte, 2)
+	padBuf := make([]byte, 256) // Pre-allocated padding buffer
 
 	for {
-		if _, err := io.ReadFull(br, hdr); err != nil {
-			return err
-		}
-		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
-
-		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(br, body); err != nil {
+		// Read whatever is available (up to 16KB)
+		n, err := br.Read(buf)
+		if err != nil {
 			return err
 		}
 
+		payload := buf[:n]
 		padLen, err := visionRandPadLen()
 		if err != nil {
 			return fmt.Errorf("vision rand: %w", err)
 		}
+
+		// 1. Write Fake TLS Header (5 bytes)
+		hdr[0] = 0x17
+		hdr[1] = 0x03
+		hdr[2] = 0x03
+		binary.BigEndian.PutUint16(hdr[3:5], uint16(2+int(padLen)+len(payload)))
+		if _, err := dst.Write(hdr); err != nil {
+			return err
+		}
+
+		// 2. Write PadLen field (2 bytes)
 		binary.BigEndian.PutUint16(framePfx, padLen)
 		if _, err := dst.Write(framePfx); err != nil {
 			return err
 		}
+
+		// 3. Write Padding (random noise)
 		if padLen > 0 {
-			pad := make([]byte, padLen)
+			pad := padBuf[:padLen]
 			if _, err := rand.Read(pad); err != nil {
 				return fmt.Errorf("vision rand pad: %w", err)
 			}
@@ -66,49 +78,46 @@ func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
 				return err
 			}
 		}
-		if _, err := dst.Write(hdr); err != nil {
-			return err
-		}
-		if _, err := dst.Write(body); err != nil {
+
+		// 4. Write Payload
+		if _, err := dst.Write(payload); err != nil {
 			return err
 		}
 	}
 }
 
-// visionCopyFromTunnel читает Vision-фреймированные данные из src (yamux stream),
-// снимает padding, пишет raw inner TLS в dst (app-соединение).
+// visionCopyFromTunnel reads Vision-framed data from src, removes padding and fake headers,
+// and writes the raw inner data to dst.
 func visionCopyFromTunnel(dst io.Writer, src io.Reader) error {
-	br := bufio.NewReaderSize(src, 32*1024)
 	pfxBuf := make([]byte, 2)
 	hdr := make([]byte, 5)
 
 	for {
-		if _, err := io.ReadFull(br, pfxBuf); err != nil {
+		// 1. Read Fake TLS header (5 bytes)
+		if _, err := io.ReadFull(src, hdr); err != nil {
 			return err
 		}
-		padLen := binary.BigEndian.Uint16(pfxBuf)
+		totalLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
+		// 2. Read PadLen (2 bytes)
+		if _, err := io.ReadFull(src, pfxBuf); err != nil {
+			return err
+		}
+		padLen := int(binary.BigEndian.Uint16(pfxBuf))
+
+		// 3. Skip Padding
 		if padLen > 0 {
-			discard := make([]byte, padLen)
-			if _, err := io.ReadFull(br, discard); err != nil {
+			if _, err := io.CopyN(io.Discard, src, int64(padLen)); err != nil {
 				return err
 			}
 		}
 
-		// Читаем TLS record header и body.
-		if _, err := io.ReadFull(br, hdr); err != nil {
-			return err
+		// 4. Read ONLY the actual payload
+		payloadLen := totalLen - 2 - padLen
+		if payloadLen < 0 {
+			return fmt.Errorf("vision: invalid frame length")
 		}
-		bodyLen := int(binary.BigEndian.Uint16(hdr[3:5]))
-		body := make([]byte, bodyLen)
-		if _, err := io.ReadFull(br, body); err != nil {
-			return err
-		}
-
-		if _, err := dst.Write(hdr); err != nil {
-			return err
-		}
-		if _, err := dst.Write(body); err != nil {
+		if _, err := io.CopyN(dst, src, int64(payloadLen)); err != nil {
 			return err
 		}
 	}
@@ -121,6 +130,89 @@ func visionRandPadLen() (uint16, error) {
 		return 0, err
 	}
 	return uint16(b[0]), nil // 0..255
+}
+
+// VisionUDPFrame - Vision-фрейм для UDP датаграмм:
+// [2 bytes: padLen, big-endian]
+// [padLen bytes: random noise]
+// [4 bytes: payload length, big-endian]
+// [payloadLen bytes: UDP payload]
+
+// visionReadDatagram читает один Vision-UDP фрейм из src и возвращает raw payload.
+func visionReadDatagram(src io.Reader) ([]byte, error) {
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(src, hdr); err != nil {
+		return nil, fmt.Errorf("read vision udp hdr: %w", err)
+	}
+	totalLen := int(binary.BigEndian.Uint16(hdr[3:5]))
+
+	pfxBuf := make([]byte, 2)
+	if _, err := io.ReadFull(src, pfxBuf); err != nil {
+		return nil, fmt.Errorf("read padLen: %w", err)
+	}
+	padLen := int(binary.BigEndian.Uint16(pfxBuf))
+
+	if padLen > 0 {
+		if _, err := io.CopyN(io.Discard, src, int64(padLen)); err != nil {
+			return nil, fmt.Errorf("skip padding: %w", err)
+		}
+	}
+
+	payloadLen := totalLen - 2 - padLen
+	if payloadLen < 0 {
+		return nil, fmt.Errorf("vision udp: invalid frame length")
+	}
+
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(src, payload); err != nil {
+		return nil, fmt.Errorf("read payload: %w", err)
+	}
+
+	return payload, nil
+}
+
+// visionWriteDatagram записывает один Vision-UDP фрейм (Header + Padding + Payload) в dst.
+func visionWriteDatagram(dst io.Writer, payload []byte) error {
+	padLen, err := visionRandPadLen()
+	if err != nil {
+		return fmt.Errorf("vision rand: %w", err)
+	}
+
+	// 1. Write Fake TLS Header (5 bytes)
+	// Total length = 2 (for padLen field) + padLen + len(payload)
+	hdr := make([]byte, 5)
+	hdr[0] = 0x17
+	hdr[1] = 0x03
+	hdr[2] = 0x03
+	binary.BigEndian.PutUint16(hdr[3:5], uint16(2+int(padLen)+len(payload)))
+	if _, err := dst.Write(hdr); err != nil {
+		return fmt.Errorf("write hdr: %w", err)
+	}
+
+	// 2. Write PadLen field (2 bytes)
+	pfxBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(pfxBuf, padLen)
+	if _, err := dst.Write(pfxBuf); err != nil {
+		return fmt.Errorf("write padLen: %w", err)
+	}
+
+	// 3. Write Padding (random noise)
+	if padLen > 0 {
+		pad := make([]byte, padLen)
+		if _, err := rand.Read(pad); err != nil {
+			return fmt.Errorf("write padding: %w", err)
+		}
+		if _, err := dst.Write(pad); err != nil {
+			return fmt.Errorf("write padding: %w", err)
+		}
+	}
+
+	// 4. Write Payload
+	if _, err := dst.Write(payload); err != nil {
+		return fmt.Errorf("write payload: %w", err)
+	}
+
+	return nil
 }
 
 // peekConn оборачивает net.Conn и воспроизводит один уже прочитанный байт
@@ -192,8 +284,8 @@ func (v *visionConn) Close() error {
 	return v.Conn.Close()
 }
 
-// openVisionStream открывает yamux-поток типа 0x03 (Vision TCP tunnel).
-// Протокол совпадает с openStream, но первый байт команды = 0x03.
+// openVisionStream opens a yamux stream for Vision TCP tunnel.
+// Uses cmd=0x00 for Vision framing.
 func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.Conn, error) {
 	stream, err := s.Open()
 	if err != nil {
@@ -208,7 +300,9 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 	}
 
 	var addrBytes []byte
-	ip := net.ParseIP(destHost)
+	// Normalize: net.ParseIP doesn't like brackets
+	cleanHost := strings.Trim(destHost, "[]")
+	ip := net.ParseIP(cleanHost)
 	if ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
 			addrBytes = append([]byte{0x01}, ip4...)
@@ -226,7 +320,7 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 	var portBytes [2]byte
 	binary.BigEndian.PutUint16(portBytes[:], destPort)
 
-	req := append([]byte{0x03}, addrBytes...) // cmd = 0x03 (Vision)
+	req := append([]byte{0x00}, addrBytes...)
 	req = append(req, portBytes[:]...)
 	if gConnectionsTimeOut > 0 {
 		stream.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
