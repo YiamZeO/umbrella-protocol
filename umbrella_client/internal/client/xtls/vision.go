@@ -178,8 +178,19 @@ func visionWriteDatagram(dst io.Writer, payload []byte) error {
 		return fmt.Errorf("vision rand: %w", err)
 	}
 
+	// Ensure total length (2 + padLen + len(payload)) doesn't exceed 65535 (uint16 limit).
+	// Most UDP packets are ~1400-1500 bytes, but standard max is 65507.
+	if 2+int(padLen)+len(payload) > 65535 {
+		if len(payload) > 65533 {
+			padLen = 0
+			// If payload itself is > 65535, it will be truncated by uint16 cast.
+			// But in SOCKS5 UDP, payload is typically <= 65507 + headers.
+		} else {
+			padLen = uint16(65535 - 2 - len(payload))
+		}
+	}
+
 	// 1. Write Fake TLS Header (5 bytes)
-	// Total length = 2 (for padLen field) + padLen + len(payload)
 	hdr := make([]byte, 5)
 	hdr[0] = 0x17
 	hdr[1] = 0x03
@@ -361,9 +372,7 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 		appWriter: appWrite,
 	}
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		visionCopyToTunnel(stream, visionRead)
 		if hc, ok := stream.(interface{ CloseWrite() error }); ok {
 			hc.CloseWrite()
@@ -372,9 +381,7 @@ func openVisionStream(s *yamux.Session, destHost string, destPort uint16) (net.C
 		}
 	}()
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		visionCopyFromTunnel(visionWrite, stream)
 		visionWrite.Close()
 	}()

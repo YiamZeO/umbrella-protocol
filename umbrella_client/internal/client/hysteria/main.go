@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,7 @@ func (g *customCIDGenerator) GenerateConnectionID() (quic.ConnectionID, error) {
 }
 
 func (g *customCIDGenerator) ConnectionIDLen() int {
+	// quic-go использует это как подсказку для максимальной длины.
 	return 20
 }
 
@@ -65,11 +67,15 @@ var (
 	clientPool       []client.Client
 	clientPoolMu     sync.Mutex
 	poolIdx          int
-	wg               sync.WaitGroup
 )
 
 type tcpSession struct {
 	tcpConn net.Conn
+}
+
+type hyUdpSession struct {
+	hyConn     client.HyUDPConn
+	lastActive time.Time
 }
 
 func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
@@ -121,17 +127,13 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			}
 			log.Printf("[INFO] Loaded %d phases from %s", len(shaper.Phases), cfg.PhasesFile)
 		}
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			shaper.RunShaperEngine(ctx)
 		}()
 	}
 
 	if gDNSListen != "" {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
 		}()
 	}
@@ -148,23 +150,25 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		select {
 		case <-ctx.Done():
 			log.Printf("[INFO] Umbrella/Hysteria client listener closed, stopping")
-			tcpSessionsMu.Lock()
-			for _, s := range tcpSessions {
-				if s.tcpConn != nil {
-					s.tcpConn.Close()
+			go func() {
+				tcpSessionsMu.Lock()
+				for _, s := range tcpSessions {
+					if s.tcpConn != nil {
+						s.tcpConn.Close()
+					}
 				}
-			}
-			tcpSessions = nil
-			tcpSessionsMu.Unlock()
+				tcpSessions = nil
+				tcpSessionsMu.Unlock()
 
-			clientPoolMu.Lock()
-			for _, c := range clientPool {
-				if c != nil {
-					c.Close()
+				clientPoolMu.Lock()
+				for _, c := range clientPool {
+					if c != nil {
+						c.Close()
+					}
 				}
-			}
-			clientPool = nil
-			clientPoolMu.Unlock()
+				clientPool = nil
+				clientPoolMu.Unlock()
+			}()
 			return nil
 		default:
 		}
@@ -177,7 +181,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			log.Printf("[ERR] SOCKS5 accept: %v", err)
 			continue
 		}
-		wg.Add(1)
 		go handleSOCKS5(ctx, conn, dnsCache)
 	}
 }
@@ -186,7 +189,6 @@ func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
 }
 
 func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
-	defer wg.Done()
 	defer conn.Close()
 
 	cmd, host, port, err := share.Socks5Handshake(conn, cfg.UDPEnabled)
@@ -278,27 +280,6 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("pack dns: %w", err)
 	}
 
-	host, portStr, _ := net.SplitHostPort(gDNSUpstream)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
-
-	var addrBytes []byte
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
-		} else {
-			addrBytes = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		addrBytes = append([]byte{0x03, byte(len(host))}, []byte(host)...)
-	}
-	var portBytes [2]byte
-	binary.BigEndian.PutUint16(portBytes[:], port)
-
-	payload := append(addrBytes, portBytes[:]...)
-	payload = append(payload, dnsData...)
-
 	for attempt := 0; attempt < 3; attempt++ {
 		hyClient, err := getHyClientFromPool()
 		if err != nil {
@@ -321,8 +302,9 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 			continue
 		}
 
-		if err := hyConn.Send(payload, ""); err != nil {
-			log.Printf("[ERR] failed dns: %v", err)
+		if err := hyConn.Send(dnsData, gDNSUpstream); err != nil {
+			log.Printf("[ERR] failed dns send: %v", err)
+			hyConn.Close()
 			clientPoolMu.Lock()
 			for i, c := range clientPool {
 				if c == hyClient {
@@ -335,19 +317,38 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 			continue
 		}
 
-		respPayload, _, err := hyConn.Receive()
-		if err != nil {
-			log.Printf("[ERR] failed dns receive: %v", err)
-			clientPoolMu.Lock()
-			for i, c := range clientPool {
-				if c == hyClient {
-					c.Close()
-					clientPool[i] = nil
-					break
+		receiveDone := make(chan struct{})
+		var respPayload []byte
+		var receiveErr error
+
+		go func() {
+			defer close(receiveDone)
+			respPayload, _, receiveErr = hyConn.Receive()
+		}()
+
+		select {
+		case <-receiveDone:
+			hyConn.Close()
+			if receiveErr != nil {
+				log.Printf("[ERR] failed dns receive: %v", receiveErr)
+				clientPoolMu.Lock()
+				for i, c := range clientPool {
+					if c == hyClient {
+						c.Close()
+						clientPool[i] = nil
+						break
+					}
 				}
+				clientPoolMu.Unlock()
+				continue
 			}
-			clientPoolMu.Unlock()
+		case <-time.After(10 * time.Second):
+			hyConn.Close()
+			log.Printf("[WARN] DNS receive timeout for %s", r.Question[0].Name)
 			continue
+		case <-ctx.Done():
+			hyConn.Close()
+			return nil, ctx.Err()
 		}
 
 		respMsg := new(dns.Msg)
@@ -373,8 +374,13 @@ func getHyClientFromPool() (client.Client, error) {
 	idx := poolIdx % hyClientPoolSize
 	poolIdx++
 
-	if clientPool[idx] != nil {
+	if clientPool[idx] != nil && !clientPool[idx].IsClosed() {
 		return clientPool[idx], nil
+	}
+
+	if clientPool[idx] != nil {
+		clientPool[idx].Close()
+		clientPool[idx] = nil
 	}
 
 	connFactory := &udpConnFactory{}
@@ -495,8 +501,35 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 
 	log.Printf("[INFO] UDP relay active, local UDP: %s", udpAddr)
 
-	var addrMu sync.Mutex
-	var appAddr net.Addr
+	var (
+		addrMu      sync.Mutex
+		appAddr     net.Addr
+		sessions    = make(map[string]*hyUdpSession)
+		sessionsMu  sync.Mutex
+		sessionWait = make(map[string]chan struct{}) // To prevent duplicate session creation
+	)
+
+	// Session cleanup worker
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sessionsMu.Lock()
+				for target, sess := range sessions {
+					if time.Since(sess.lastActive) > 60*time.Second {
+						log.Printf("[INFO] Closing idle Hysteria UDP session for %s", target)
+						sess.hyConn.Close()
+						delete(sessions, target)
+					}
+				}
+				sessionsMu.Unlock()
+			}
+		}
+	}()
 
 	// App → Server (Dynamic routing)
 	go func() {
@@ -516,23 +549,31 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				return
 			}
 
-			// Track application address
+			// Track application address dynamically (Discord might use multiple ports)
 			addrMu.Lock()
 			if appAddr == nil {
 				appAddr = addr
+				// log.Printf("[DEBUG] UDP relay: first app addr detected: %s", addr)
 			}
 			isApp := addr.String() == appAddr.String()
+			// If not first app addr, check if it's still from localhost (possible second port from Discord)
+			if !isApp {
+				if udpAddr, ok := addr.(*net.UDPAddr); ok && udpAddr.IP.IsLoopback() {
+					isApp = true
+					// We don't update appAddr here to keep responses going to the primary port,
+					// but SOCKS5 UDP usually expects responses to the port that sent the packet.
+				}
+			}
 			addrMu.Unlock()
 
 			if !isApp {
-				// This is a direct response from a bypassed host
+				// Response from direct/bypassed host - send back to the last known app port
 				addrMu.Lock()
 				app := appAddr
 				addrMu.Unlock()
 				if app != nil {
-					// Extract source address from the incoming packet
 					udpSrc := addr.(*net.UDPAddr)
-					resp := []byte{0, 0, 0} // RSV(2), FRAG(1)
+					resp := []byte{0, 0, 0}
 					if ip4 := udpSrc.IP.To4(); ip4 != nil {
 						resp = append(resp, 0x01)
 						resp = append(resp, ip4...)
@@ -549,7 +590,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				continue
 			}
 
-			// This is from the app. Parse destination.
+			// From app. Parse destination.
 			if n < 4 || buf[2] != 0x00 {
 				continue
 			}
@@ -574,7 +615,6 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 			}
 
 			if isShouldBypass {
-				// Bypass! Send directly.
 				targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 				if err == nil {
 					udpConn.WriteTo(buf[dataStart:n], targetAddr)
@@ -582,12 +622,121 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				continue
 			}
 
-			// Not bypass. Send through hysteria UDP session.
-			// Create a temporary UDP session for this request
+			// Tunnel through Hysteria
 			targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
-			// Handle the UDP request through hysteria
-			go handleUDPThroughHysteria(udpConn, appAddr, buf[dataStart:n], host, port, targetAddr)
+			sessionsMu.Lock()
+			sess, ok := sessions[targetAddr]
+			if ok {
+				sess.lastActive = time.Now()
+				if err := sess.hyConn.Send(buf[dataStart:n], targetAddr); err != nil {
+					log.Printf("[ERR] Cached Hysteria UDP send failed: %v", err)
+					sess.hyConn.Close()
+					delete(sessions, targetAddr)
+					ok = false
+				}
+			}
+
+			if !ok {
+				waitCh, busy := sessionWait[targetAddr]
+				if busy {
+					sessionsMu.Unlock()
+					go func(data []byte) {
+						<-waitCh
+						sessionsMu.Lock()
+						if s, stillOk := sessions[targetAddr]; stillOk {
+							s.lastActive = time.Now()
+							s.hyConn.Send(data, targetAddr)
+						}
+						sessionsMu.Unlock()
+					}(append([]byte(nil), buf[dataStart:n]...))
+					continue
+				}
+
+				waitCh = make(chan struct{})
+				sessionWait[targetAddr] = waitCh
+				sessionsMu.Unlock()
+
+				go func(data []byte, t string, sender net.Addr) {
+					defer func() {
+						sessionsMu.Lock()
+						delete(sessionWait, t)
+						close(waitCh)
+						sessionsMu.Unlock()
+					}()
+
+					for attempt := 0; attempt < 3; attempt++ {
+						hyClient, err := getHyClientFromPool()
+						if err != nil {
+							log.Printf("[ERR] get hyClient from pool: %v", err)
+							continue
+						}
+						hyConn, err := hyClient.UDP()
+						if err != nil {
+							log.Printf("[ERR] get hyConn from hyClient: %v", err)
+							continue
+						}
+						if err := hyConn.Send(data, t); err != nil {
+							log.Printf("[ERR] failed udp send to %s: %v", targetAddr, err)
+							hyConn.Close()
+							continue
+						}
+
+						newSess := &hyUdpSession{
+							hyConn:     hyConn,
+							lastActive: time.Now(),
+						}
+						sessionsMu.Lock()
+						sessions[t] = newSess
+						sessionsMu.Unlock()
+
+						// Response listener loop
+						go func() {
+							for {
+								resp, from, err := hyConn.Receive()
+								if err != nil {
+									log.Printf("[ERR] failed udp receive: %v", err)
+									return
+								}
+								sessionsMu.Lock()
+								if s, stillExists := sessions[t]; stillExists && s.hyConn == hyConn {
+									s.lastActive = time.Now()
+								}
+								sessionsMu.Unlock()
+
+								// Wrap in SOCKS5 with ACTUAL source address
+								respHeader := []byte{0, 0, 0}
+
+								// Parse 'from' address (it can be different from 't')
+								hostStr, portStr, _ := net.SplitHostPort(from)
+								fromPort, _ := strconv.ParseUint(portStr, 10, 16)
+
+								if ip := net.ParseIP(hostStr); ip != nil {
+									if ip4 := ip.To4(); ip4 != nil {
+										respHeader = append(respHeader, 0x01)
+										respHeader = append(respHeader, ip4...)
+									} else {
+										respHeader = append(respHeader, 0x04)
+										respHeader = append(respHeader, ip.To16()...)
+									}
+								} else {
+									respHeader = append(respHeader, 0x03, byte(len(hostStr)))
+									respHeader = append(respHeader, []byte(hostStr)...)
+								}
+								var pb [2]byte
+								binary.BigEndian.PutUint16(pb[:], uint16(fromPort))
+								respHeader = append(respHeader, pb[:]...)
+								respHeader = append(respHeader, resp...)
+
+								udpConn.WriteTo(respHeader, sender)
+							}
+						}()
+						return
+					}
+				}(append([]byte(nil), buf[dataStart:n]...), targetAddr, addr)
+			} else {
+				sessionsMu.Unlock()
+			}
 		}
 	}()
 
@@ -596,81 +745,6 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 	return err
 }
 
-// handleUDPThroughHysteria handles UDP requests through hysteria tunnel using client pool with retries
+// handleUDPThroughHysteria is no longer used individually as logic moved to handleSocks5UDP for session caching
 func handleUDPThroughHysteria(udpConn net.PacketConn, appAddr net.Addr, data []byte, host string, port uint16, targetAddr string) {
-	for attempt := 0; attempt < 3; attempt++ {
-		// Get client from pool instead of creating new one
-		hyClient, err := getHyClientFromPool()
-		if err != nil {
-			log.Printf("[ERR] get hyClient from pool: %v", err)
-			return
-		}
-
-		hyConn, err := hyClient.UDP()
-		if err != nil {
-			log.Printf("[ERR] dial UDP: %v", err)
-			// Remove client from pool and retry
-			clientPoolMu.Lock()
-			for i, c := range clientPool {
-				if c == hyClient {
-					c.Close()
-					clientPool[i] = nil
-					break
-				}
-			}
-			clientPoolMu.Unlock()
-			continue
-		}
-
-		// Send data through hysteria
-		if err := hyConn.Send(data, targetAddr); err != nil {
-			log.Printf("[ERR] failed udp send to %s: %v", targetAddr, err)
-			// Remove client from pool and retry
-			clientPoolMu.Lock()
-			for i, c := range clientPool {
-				if c == hyClient {
-					c.Close()
-					clientPool[i] = nil
-					break
-				}
-			}
-			clientPoolMu.Unlock()
-			continue
-		}
-
-		// Set up response relay
-		go func() {
-			resp, _, err := hyConn.Receive()
-			if err != nil {
-				log.Printf("[ERR] failed udp receive: %v", err)
-				return
-			}
-
-			// Wrap response in SOCKS5 format
-			respHeader := []byte{0, 0, 0} // RSV(2), FRAG(1)
-			if ip4 := net.ParseIP(host); ip4 != nil && ip4.To4() != nil {
-				respHeader = append(respHeader, 0x01)
-				respHeader = append(respHeader, ip4.To4()...)
-			} else if ip6 := net.ParseIP(host); ip6 != nil {
-				respHeader = append(respHeader, 0x04)
-				respHeader = append(respHeader, ip6.To16()...)
-			} else {
-				// Domain name
-				hostBytes := []byte(host)
-				respHeader = append(respHeader, 0x03, byte(len(hostBytes)))
-				respHeader = append(respHeader, hostBytes...)
-			}
-			var p [2]byte
-			binary.BigEndian.PutUint16(p[:], uint16(port))
-			respHeader = append(respHeader, p[:]...)
-			respHeader = append(respHeader, resp...)
-
-			udpConn.WriteTo(respHeader, appAddr)
-		}()
-
-		// Success, return
-		return
-	}
-
-	log.Printf("[ERR] failed to handle UDP via hysteria after 3 attempts")
 }

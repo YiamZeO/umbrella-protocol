@@ -52,6 +52,17 @@ func NewPresetsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *log
 				presetListBox.Refresh()
 				currentPresetLbl.SetText("Current preset: " + appSettings.CurrentPreset)
 			}),
+			widget.NewButton("Overwrite", func() {
+				if err := appSettings.OverwritePreset(name, appRef); err != nil {
+					l.AppendLog("[ERR] Failed to overwrite preset: " + err.Error())
+					dialogs.ShowStyledError(presetsEditor, "Overwrite Error", err.Error())
+					return
+				}
+				l.AppendLog("Overwrited preset: " + name)
+				appRef.SendNotification(fyne.NewNotification("Preset Overwrited", name))
+				presetListBox.Refresh()
+				currentPresetLbl.SetText("Current preset: " + appSettings.CurrentPreset)
+			}),
 			widget.NewButton("Delete", func() {
 				if err := appSettings.DeletePreset(name, appRef); err != nil {
 					l.AppendLog("[ERR] Failed to delete preset: " + err.Error())

@@ -85,6 +85,10 @@ func startHysteriaServer() {
 	}
 	defer ln.Close()
 
+	if err := ln.SetWriteBuffer(4 * 1024 * 1024); err != nil {
+		log.Printf("[ERR] Failed to set UDP write buffer: %v", err)
+	}
+
 	var certErr error
 	certOnce.Do(func() {
 		cachedCert, certErr = generateSelfSignedCert()
@@ -165,6 +169,14 @@ func startFrontend() {
 	frontendLn = ln
 	defer ln.Close()
 
+	// Increase UDP buffer sizes for high-speed QUIC traffic
+	if err := ln.SetReadBuffer(4 * 1024 * 1024); err != nil {
+		log.Printf("[ERR] Failed to set UDP read buffer: %v", err)
+	}
+	if err := ln.SetWriteBuffer(4 * 1024 * 1024); err != nil {
+		log.Printf("[ERR] Failed to set UDP write buffer: %v", err)
+	}
+
 	buf := make([]byte, 65535)
 	for {
 		n, clientAddr, err := ln.ReadFromUDP(buf)
@@ -195,6 +207,8 @@ func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
 	sessionsMu.RUnlock()
 
 	if sess != nil {
+		// Update activity deadline on incoming traffic from client
+		sess.backend.SetReadDeadline(time.Now().Add(120 * time.Second))
 		sess.backend.Write(packet)
 		return
 	}
@@ -231,7 +245,11 @@ func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
 			log.Printf("[INFO] Valid client (SCID HMAC), forwarding to Hysteria → %s", clientAddr.IP.String())
 			forwardToHysteria(packet, clientAddr)
 			return
+		} else {
+			log.Printf("[ERR] HMAC verification failed for %s", clientAddr.IP.String())
 		}
+	} else if len(scid) > 0 {
+		log.Printf("[ERR] Unexpected SCID length: %d from %s", len(scid), clientAddr.IP.String())
 	}
 
 	log.Printf("[INFO] Unknown client, forwarding to dest → %s", clientAddr.IP.String())
@@ -254,6 +272,10 @@ func forwardToHysteria(packet []byte, clientAddr *net.UDPAddr) *session {
 		log.Printf("[ERR] dial hysteria: %v", err)
 		return nil
 	}
+
+	// Increase UDP buffer sizes for backend connection
+	backend.SetReadBuffer(2 * 1024 * 1024)
+	backend.SetWriteBuffer(2 * 1024 * 1024)
 
 	if _, err := backend.Write(packet); err != nil {
 		log.Printf("[ERR] write to hysteria: %v", err)
@@ -320,7 +342,7 @@ func proxyUDP(sess *session, target string) {
 		n, _, err := sess.backend.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("[DEBUG] %s proxy timeout", target)
+				log.Printf("[INFO] %s proxy timeout", target)
 			} else {
 				log.Printf("[ERR] %s proxy read: %v", target, err)
 			}

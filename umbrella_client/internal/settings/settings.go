@@ -229,6 +229,34 @@ func (s *AppSettings) LoadPreset(name string, appRef fyne.App) error {
 	return SaveAppSettings(s, appRef)
 }
 
+func (s *AppSettings) OverwritePreset(name string, appRef fyne.App) error {
+	if !Contains(s.Presets, name) {
+		return fmt.Errorf("preset not found: %s", name)
+	}
+
+	configData, err := storage.LoadConfig(s.AppFilesDir, appRef)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	err = os.WriteFile(presetConfigPath(name, s.AppFilesDir), configData, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to overwrite config: %w", err)
+	}
+
+	phasesData, err := storage.LoadPhases(s.AppFilesDir, appRef)
+	if err != nil {
+		return fmt.Errorf("failed to read phases: %w", err)
+	}
+
+	err = os.WriteFile(presetPhasesPath(name, s.AppFilesDir), phasesData, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to overwrite phases: %w", err)
+	}
+
+	return nil
+}
+
 func (s *AppSettings) ListPresets() []string {
 	return s.Presets
 }

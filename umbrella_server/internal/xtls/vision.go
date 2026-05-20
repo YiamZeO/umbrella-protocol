@@ -173,8 +173,16 @@ func visionWriteDatagram(dst io.Writer, payload []byte) error {
 		return fmt.Errorf("vision rand: %w", err)
 	}
 
+	// Ensure total length (2 + padLen + len(payload)) doesn't exceed 65535 (uint16 limit).
+	if 2+int(padLen)+len(payload) > 65535 {
+		if len(payload) > 65533 {
+			padLen = 0
+		} else {
+			padLen = uint16(65535 - 2 - len(payload))
+		}
+	}
+
 	// 1. Write Fake TLS Header (5 bytes)
-	// Total length = 2 (for padLen field) + padLen + len(payload)
 	hdr := make([]byte, 5)
 	hdr[0] = 0x17
 	hdr[1] = 0x03

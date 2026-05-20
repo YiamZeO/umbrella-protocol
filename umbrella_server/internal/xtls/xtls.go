@@ -96,7 +96,7 @@ func XtlsStarter(cfg *config.Config) {
 	if err != nil {
 		log.Fatalf("[ERR] listen :%s: %v", cfg.Port, err)
 	}
-	log.Printf("[INFO] Umbrella/Reality server on :%s (fallback → %s)", cfg.Port, dest)
+	log.Printf("[INFO] Umbrella/Xtls server on :%s (fallback → %s)", cfg.Port, dest)
 
 	realityLn := reality.NewListener(ln, realityConf)
 	for {

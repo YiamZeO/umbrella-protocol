@@ -51,7 +51,6 @@ var (
 	gShaper             bool
 	gSessionsNum        int
 	gConnectionsTimeOut time.Duration
-	wg                  sync.WaitGroup
 
 	// Session pool
 	sessions     []*yamux.Session
@@ -133,9 +132,7 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			}
 			log.Printf("[INFO] Loaded %d phases from %s", len(shaper.Phases), cfg.PhasesFile)
 		}
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			shaper.RunShaperEngine(ctx)
 		}()
 	}
@@ -144,9 +141,7 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 	go startWhiteNoise(ctx)
 
 	if gDNSListen != "" {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
 		}()
 	}
@@ -171,14 +166,11 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			log.Printf("[ERR] SOCKS5 accept: %v", err)
 			continue
 		}
-		wg.Add(1)
 		go handleSOCKS5(ctx, conn, dnsCache)
 	}
 }
 
 func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
-	defer wg.Done()
-
 	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
 	defer conn.Close()
@@ -643,9 +635,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		return nil, err
 	}
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		scheduleReconnect(ctx, sess)
 	}()
 
@@ -790,7 +780,7 @@ func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
 		if err == nil {
 			break
 		}
-		log.Printf("[DEBUG] DNS attempt %d failed: %v", attempt+1, err)
+		log.Printf("[ERR] DNS attempt %d failed: %v", attempt+1, err)
 	}
 
 	if respPayload == nil {

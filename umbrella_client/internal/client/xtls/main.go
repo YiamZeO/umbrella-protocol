@@ -47,7 +47,6 @@ var (
 	sessMu              []sync.Mutex
 	getSessionMu        sync.Mutex // Global lock to prevent simultaneous session establishment
 	sessions            []*yamux.Session
-	wg                  sync.WaitGroup
 )
 
 func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
@@ -116,9 +115,7 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 			}
 			log.Printf("[INFO] Loaded %d phases from %s", len(shaper.Phases), cfg.PhasesFile)
 		}
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			shaper.RunShaperEngine(ctx)
 		}()
 	}
@@ -127,19 +124,15 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
-	log.Printf("[INFO] Umbrella/Reality client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
+	log.Printf("[INFO] Umbrella/Xtls client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
 
 	if gDNSListen != "" {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
 		}()
 	}
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		<-ctx.Done()
 		ln.Close()
 		for i := 0; i < gSessionsNum; i++ {
@@ -155,10 +148,9 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[INFO] Umbrella/Reality client listener closed, stopping")
+			log.Printf("[INFO] Umbrella/Xtls client listener closed, stopping")
 			ch := make(chan bool)
 			go func() {
-				wg.Wait()
 				ch <- true
 			}()
 			select {
@@ -189,9 +181,7 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 				tcpConn.SetDeadline(time.Time{})
 			}
 
-			wg.Add(1)
 			go func() {
-				defer wg.Done()
 				handleSocks5(ctx, conn, dnsCache)
 			}()
 		}
@@ -447,9 +437,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		return nil, fmt.Errorf("yamux client: %w", err)
 	}
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		scheduleReconnect(ctx, sess)
 	}()
 	sessions[idx] = sess
@@ -788,6 +776,11 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 			if a == nil {
 				continue
 			}
+			// SOCKS5 UDP response header: RSV(2) + FRAG(1)
+			pktBuf[0] = 0x00
+			pktBuf[1] = 0x00
+			pktBuf[2] = 0x00
+			copy(pktBuf[3:], payload)
 			udpConn.WriteTo(pktBuf[:3+len(payload)], a)
 		}
 	}()

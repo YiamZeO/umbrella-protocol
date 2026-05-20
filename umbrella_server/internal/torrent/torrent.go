@@ -105,7 +105,7 @@ func handleTorrentConn(conn net.Conn) {
 		}
 		conn.Close()
 	}()
-	log.Printf("[DEBUG] Incoming connection from %s", conn.RemoteAddr())
+	log.Printf("[INFO] Incoming connection from %s", conn.RemoteAddr())
 	// 1. Read BitTorrent Handshake
 	handshake := make([]byte, handshakeLen)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))

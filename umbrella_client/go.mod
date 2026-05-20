@@ -72,6 +72,8 @@ require (
 	golang.org/x/tools v0.41.0 // indirect
 )
 
-replace github.com/apernet/hysteria/core/v2 => github.com/Haonixao/hysteria/core/v2 v2.0.0-20260507173638-d3c5980cb2a4
+replace github.com/apernet/hysteria/core/v2 => github.com/Haonixao/hysteria/core/v2 v2.0.0-20260519181509-74e6ca42097b
+
+replace github.com/apernet/hysteria/extras/v2 => github.com/Haonixao/hysteria/extras/v2 v2.0.0-20260519181509-74e6ca42097b
 
 replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260512111648-6d2d2fc87c8c
